@@ -16,8 +16,10 @@ use log::debug;
 use pingora_error::{ErrorType, OrErr, Result};
 use std::ops::{Deref, DerefMut};
 
+use crate::listeners::tls::boringssl_openssl::alpn::valid_alpn;
 pub use crate::protocols::tls::ALPN;
 use crate::protocols::{GetSocketDigest, IO};
+use crate::tls::ssl::AlpnError;
 use crate::tls::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
 use crate::{
     listeners::TlsAcceptCallbacks,
@@ -26,7 +28,6 @@ use crate::{
         SslStream,
     },
 };
-
 pub const TLS_CONF_ERR: ErrorType = ErrorType::Custom("TLSConfigError");
 
 pub(crate) struct Acceptor {
@@ -113,6 +114,18 @@ impl TlsSettings {
                 .set_alpn_select_callback(alpn::prefer_h2),
             ALPN::H1 => self.accept_builder.set_alpn_select_callback(alpn::h1_only),
             ALPN::H2 => self.accept_builder.set_alpn_select_callback(alpn::h2_only),
+            ALPN::Custom(custom) => {
+                self.accept_builder
+                    .set_alpn_select_callback(move |_, alpn_in| {
+                        if !valid_alpn(alpn_in) {
+                            return Err(AlpnError::NOACK);
+                        }
+                        match alpn::select_protocol(alpn_in, custom.protocol()) {
+                            Some(p) => Ok(p),
+                            None => Err(AlpnError::NOACK),
+                        }
+                    });
+            }
         }
     }
 
@@ -138,7 +151,9 @@ impl Acceptor {
     /// Perform TLS handshake with ClientHello extraction
     /// This wraps the stream with ClientHelloWrapper before TLS handshake
     #[cfg(unix)]
-    pub async fn tls_handshake_with_client_hello<S: IO + GetSocketDigest + std::os::unix::io::AsRawFd + 'static>(
+    pub async fn tls_handshake_with_client_hello<
+        S: IO + GetSocketDigest + std::os::unix::io::AsRawFd + 'static,
+    >(
         &self,
         stream: S,
     ) -> Result<SslStream<crate::protocols::ClientHelloWrapper<S>>> {
@@ -150,10 +165,14 @@ impl Acceptor {
         // Extract ClientHello before TLS handshake (sync version blocks until data is available)
         if let Ok(Some(hello)) = wrapper.extract_client_hello() {
             // Get peer address if available
-            let peer_addr = wrapper.get_socket_digest()
+            let peer_addr = wrapper
+                .get_socket_digest()
                 .and_then(|d| d.peer_addr().cloned());
 
-            debug!("Extracted ClientHello: SNI={:?}, ALPN={:?}, Peer={:?}", hello.sni, hello.alpn, peer_addr);
+            debug!(
+                "Extracted ClientHello: SNI={:?}, ALPN={:?}, Peer={:?}",
+                hello.sni, hello.alpn, peer_addr
+            );
 
             // Generate fingerprint from raw ClientHello bytes
             // This will be handled by moat's tls_client_hello module
@@ -173,12 +192,33 @@ mod alpn {
     use super::*;
     use crate::tls::ssl::{select_next_proto, AlpnError, SslRef};
 
-    fn valid_alpn(alpn_in: &[u8]) -> bool {
+    pub(super) fn valid_alpn(alpn_in: &[u8]) -> bool {
         if alpn_in.is_empty() {
             return false;
         }
         // TODO: can add more thorough validation here.
         true
+    }
+
+    /// Finds the first protocol in the client-offered ALPN list that matches the given protocol.
+    ///
+    /// This is a helper for ALPN negotiation. It iterates over the client's protocol list
+    /// (in wire format) and returns the first protocol that matches proto
+    /// The returned reference always points into `client_protocols`, so lifetimes are correct.
+    pub(super) fn select_protocol<'a>(
+        client_protocols: &'a [u8],
+        proto: &[u8],
+    ) -> Option<&'a [u8]> {
+        let mut bytes = client_protocols;
+        while !bytes.is_empty() {
+            let len = bytes[0] as usize;
+            bytes = &bytes[1..];
+            if len == proto.len() && &bytes[..len] == proto {
+                return Some(&bytes[..len]);
+            }
+            bytes = &bytes[len..];
+        }
+        None
     }
 
     // A standard implementation provided by the SSL lib is used below
