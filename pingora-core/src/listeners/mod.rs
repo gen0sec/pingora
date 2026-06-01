@@ -129,6 +129,66 @@ fn call_client_hello_callback(
     }
 }
 
+/// Callback function type for parsed PROXY protocol v2 extension TLVs.
+///
+/// Invoked from `UninitializedStream::handshake` right after
+/// `maybe_consume_proxy_header` parses a v2 header and recovers the
+/// real client `SocketAddr`. Lets consumer applications (synapse,
+/// custom logging) pull metadata out of application-defined TLVs
+/// (HAProxy spec § 2.2 reserves type IDs `0xE0..=0xEF`) without
+/// needing to parse the wire bytes themselves.
+///
+/// Signature mirrors `ClientHelloCallback`: a pointer fn so the
+/// registration can stay `Sync` without an `Arc<dyn Fn>` shuffle.
+pub type ProxyV2TlvCallback = Option<fn(&[proxy_protocol::ExtensionTlv], SocketAddr)>;
+
+/// Global callback for parsed PROXY v2 extension TLVs. Registered by
+/// `set_proxy_v2_tlv_callback`, invoked by `call_proxy_v2_tlv_callback`.
+static PROXY_V2_TLV_CALLBACK: std::sync::OnceLock<std::sync::Mutex<ProxyV2TlvCallback>> =
+    std::sync::OnceLock::new();
+
+/// Register a callback that receives the parsed PROXY v2 extension
+/// TLVs from every accepted connection (in addition to the recovered
+/// source address that `maybe_consume_proxy_header` already plumbs
+/// into the SocketDigest).
+///
+/// # Example
+/// ```
+/// use pingora_core::listeners::set_proxy_v2_tlv_callback;
+/// use pingora_core::protocols::proxy_protocol::ExtensionTlv;
+/// use pingora_core::protocols::l4::socket::SocketAddr;
+///
+/// set_proxy_v2_tlv_callback(Some(|tlvs: &[ExtensionTlv], real_addr: SocketAddr| {
+///     for tlv in tlvs {
+///         if let ExtensionTlv::Custom { type_id: 0xE0, value } = tlv {
+///             // Application-defined TLV — decode and act on it.
+///             let _ = (&real_addr, value);
+///         }
+///     }
+/// }));
+/// ```
+pub fn set_proxy_v2_tlv_callback(callback: ProxyV2TlvCallback) {
+    PROXY_V2_TLV_CALLBACK.get_or_init(|| std::sync::Mutex::new(callback));
+    if let Ok(mut cb) = PROXY_V2_TLV_CALLBACK.get().unwrap().lock() {
+        *cb = callback;
+    }
+}
+
+/// Invoke the PROXY v2 TLV callback if registered. No-op when no
+/// callback is set (the common case) or when the TLV list is empty.
+fn call_proxy_v2_tlv_callback(tlvs: &[proxy_protocol::ExtensionTlv], real_addr: SocketAddr) {
+    if tlvs.is_empty() {
+        return;
+    }
+    if let Some(cb_guard) = PROXY_V2_TLV_CALLBACK.get() {
+        if let Ok(cb) = cb_guard.lock() {
+            if let Some(callback) = *cb {
+                callback(tlvs, real_addr);
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 use crate::server::ListenFds;
 
@@ -139,6 +199,9 @@ use std::{any::Any, fs::Permissions, sync::Arc};
 use l4::{ListenerEndpoint, Stream as L4Stream};
 use tls::{Acceptor, TlsSettings};
 
+pub use crate::protocols::l4::stream::{
+    L4BufferSettings, DEFAULT_L4_READ_BUFFER_SIZE, DEFAULT_L4_WRITE_BUFFER_SIZE,
+};
 pub use crate::protocols::tls::ALPN;
 use crate::protocols::GetSocketDigest;
 pub use l4::{ServerAddress, TcpSocketOptions};
@@ -174,6 +237,7 @@ pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
 struct TransportStackBuilder {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
+    l4_buffer: L4BufferSettings,
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
@@ -201,7 +265,86 @@ impl TransportStackBuilder {
         Ok(TransportStack {
             l4,
             tls: self.tls.take().map(|tls| Arc::new(tls.build())),
+            l4_buffer: self.l4_buffer,
         })
+    }
+}
+
+/// Configuration for one listening endpoint.
+///
+/// This configures the endpoint address and endpoint-specific transport
+/// settings such as [`TcpSocketOptions`], [`TlsSettings`], and L4
+/// [`BufStream`](tokio::io::BufStream) buffer sizes.
+pub struct ListenerConfig {
+    l4: ServerAddress,
+    tls: Option<TlsSettings>,
+    l4_buffer: L4BufferSettings,
+}
+
+impl ListenerConfig {
+    /// Create a TCP listening endpoint config.
+    pub fn tcp(addr: impl Into<String>) -> Self {
+        Self {
+            l4: ServerAddress::Tcp(addr.into(), None),
+            tls: None,
+            l4_buffer: L4BufferSettings::default(),
+        }
+    }
+
+    /// Create a Unix domain socket listening endpoint config.
+    #[cfg(unix)]
+    pub fn uds(addr: impl Into<String>) -> Self {
+        Self {
+            l4: ServerAddress::Uds(addr.into(), None),
+            tls: None,
+            l4_buffer: L4BufferSettings::default(),
+        }
+    }
+
+    /// Set TCP socket options for this endpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this endpoint is not TCP.
+    #[track_caller]
+    pub fn tcp_socket_options(mut self, options: TcpSocketOptions) -> Self {
+        match &mut self.l4 {
+            ServerAddress::Tcp(_, opt) => *opt = Some(options),
+            #[cfg(unix)]
+            ServerAddress::Uds(_, _) => {
+                panic!("TCP socket options can only be set on TCP endpoints")
+            }
+        }
+        self
+    }
+
+    /// Set Unix domain socket permissions for this endpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this endpoint is not a Unix domain socket.
+    #[cfg(unix)]
+    #[track_caller]
+    pub fn permissions(mut self, permissions: Permissions) -> Self {
+        match &mut self.l4 {
+            ServerAddress::Uds(_, perm) => *perm = Some(permissions),
+            ServerAddress::Tcp(_, _) => {
+                panic!("Unix domain socket permissions can only be set on UDS endpoints")
+            }
+        }
+        self
+    }
+
+    /// Set TLS settings for this endpoint.
+    pub fn tls(mut self, settings: TlsSettings) -> Self {
+        self.tls = Some(settings);
+        self
+    }
+
+    /// Set L4 `BufStream` buffer sizes for this endpoint.
+    pub fn l4_buffer(mut self, settings: L4BufferSettings) -> Self {
+        self.l4_buffer = settings;
+        self
     }
 }
 
@@ -209,6 +352,7 @@ impl TransportStackBuilder {
 pub(crate) struct TransportStack {
     l4: ListenerEndpoint,
     tls: Option<Arc<Acceptor>>,
+    l4_buffer: L4BufferSettings,
 }
 
 impl TransportStack {
@@ -221,6 +365,7 @@ impl TransportStack {
         Ok(UninitializedStream {
             l4: stream,
             tls: self.tls.clone(),
+            l4_buffer: self.l4_buffer,
         })
     }
 
@@ -232,11 +377,16 @@ impl TransportStack {
 pub(crate) struct UninitializedStream {
     l4: L4Stream,
     tls: Option<Arc<Acceptor>>,
+    l4_buffer: L4BufferSettings,
 }
 
 impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
-        self.l4.set_buffer();
+        // upstream/main gave `set_buffer` an explicit buffer-settings
+        // argument (`l4_buffer` field on UninitializedStream); keep the
+        // fork's ClientHello-then-PROXY-header ordering with the new
+        // signature.
+        self.l4.set_buffer(self.l4_buffer);
 
         // Extract ClientHello BEFORE consuming PROXY headers
         // This is necessary because PROXY header consumption rewinds ClientHello to a buffer
@@ -367,7 +517,8 @@ impl UninitializedStream {
 
         match proxy_protocol::consume_proxy_header(&mut self.l4).await {
             Ok(Some(header)) => {
-                if let Some(real_addr) = proxy_protocol::source_addr_from_header(&header) {
+                let real_addr_opt = proxy_protocol::source_addr_from_header(&header);
+                if let Some(real_addr) = real_addr_opt {
                     if let Some(digest) = self.l4.get_socket_digest() {
                         let client_addr = SocketAddr::Inet(real_addr);
                         digest.set_client_addr(client_addr.clone());
@@ -384,6 +535,19 @@ impl UninitializedStream {
                     warn!("PROXY protocol header lacked a usable client address");
                 } else {
                     debug!("PROXY protocol header contained no client address (LOCAL command)");
+                }
+                // Surface any v2 extension TLVs to the registered
+                // application callback so consumers can ride extra
+                // metadata (e.g. JA4 fingerprints) on the same hop
+                // without an out-of-band channel. We need the real
+                // source address as the key, so skip when source
+                // recovery failed.
+                if let Some(real_addr) = real_addr_opt {
+                    if let proxy_protocol::ProxyHeader::Version2 { extensions, .. } = &header {
+                        if !extensions.is_empty() {
+                            call_proxy_v2_tlv_callback(extensions, SocketAddr::Inet(real_addr));
+                        }
+                    }
                 }
             }
             Ok(None) => {
@@ -445,18 +609,22 @@ impl Listeners {
 
     /// Add a TCP endpoint to `self`.
     pub fn add_tcp(&mut self, addr: &str) {
-        self.add_address(ServerAddress::Tcp(addr.into(), None));
+        self.add_listener(ListenerConfig::tcp(addr));
     }
 
     /// Add a TCP endpoint to `self`, with the given [`TcpSocketOptions`].
     pub fn add_tcp_with_settings(&mut self, addr: &str, sock_opt: TcpSocketOptions) {
-        self.add_address(ServerAddress::Tcp(addr.into(), Some(sock_opt)));
+        self.add_listener(ListenerConfig::tcp(addr).tcp_socket_options(sock_opt));
     }
 
     /// Add a Unix domain socket endpoint to `self`.
     #[cfg(unix)]
     pub fn add_uds(&mut self, addr: &str, perm: Option<Permissions>) {
-        self.add_address(ServerAddress::Uds(addr.into(), perm));
+        let endpoint = perm.map_or_else(
+            || ListenerConfig::uds(addr),
+            |perm| ListenerConfig::uds(addr).permissions(perm),
+        );
+        self.add_listener(endpoint);
     }
 
     /// Add a TLS endpoint to `self` with the [Mozilla Intermediate](https://wiki.mozilla.org/Security/Server_Side_TLS#Intermediate_compatibility_.28recommended.29)
@@ -474,7 +642,11 @@ impl Listeners {
         sock_opt: Option<TcpSocketOptions>,
         settings: TlsSettings,
     ) {
-        self.add_endpoint(ServerAddress::Tcp(addr.into(), sock_opt), Some(settings));
+        let mut endpoint = ListenerConfig::tcp(addr).tls(settings);
+        if let Some(sock_opt) = sock_opt {
+            endpoint = endpoint.tcp_socket_options(sock_opt);
+        }
+        self.add_listener(endpoint);
     }
 
     /// Add the given [`ServerAddress`] to `self`.
@@ -496,11 +668,24 @@ impl Listeners {
         }
     }
 
-    /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided
+    /// Add the given listener endpoint to `self`.
+    pub fn add_listener(&mut self, endpoint: ListenerConfig) {
+        let ListenerConfig { l4, tls, l4_buffer } = endpoint;
+        self.stacks.push(TransportStackBuilder {
+            l4,
+            tls,
+            l4_buffer,
+            #[cfg(feature = "connection_filter")]
+            connection_filter: self.connection_filter.clone(),
+        });
+    }
+
+    /// Add the given [`ServerAddress`] to `self` with the given [`TlsSettings`] if provided.
     pub fn add_endpoint(&mut self, l4: ServerAddress, tls: Option<TlsSettings>) {
         self.stacks.push(TransportStackBuilder {
             l4,
             tls,
+            l4_buffer: L4BufferSettings::default(),
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
         })
@@ -539,14 +724,11 @@ mod test {
     #[cfg(feature = "any_tls")]
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
-    use tokio::time::{sleep, Duration};
 
     #[tokio::test]
     async fn test_listen_tcp() {
-        let addr1 = "127.0.0.1:7101";
-        let addr2 = "127.0.0.1:7102";
-        let mut listeners = Listeners::tcp(addr1);
-        listeners.add_tcp(addr2);
+        let mut listeners = Listeners::tcp("127.0.0.1:0");
+        listeners.add_tcp("127.0.0.1:0");
 
         let listeners = listeners
             .build(
@@ -557,6 +739,10 @@ mod test {
             .unwrap();
 
         assert_eq!(listeners.len(), 2);
+        let addrs: Vec<_> = listeners
+            .iter()
+            .map(|s| s.l4.local_addr().unwrap())
+            .collect();
         for listener in listeners {
             tokio::spawn(async move {
                 // just try to accept once
@@ -565,11 +751,77 @@ mod test {
             });
         }
 
-        // make sure the above starts before the lines below
-        sleep(Duration::from_millis(10)).await;
+        // The listeners are already bound (port resolved during build()),
+        // so the kernel accepts connections into the backlog immediately.
+        // No readiness wait needed — connect will succeed as soon as the
+        // OS has completed the TCP handshake.
+        TcpStream::connect(addrs[0]).await.unwrap();
+        TcpStream::connect(addrs[1]).await.unwrap();
+    }
 
-        TcpStream::connect(addr1).await.unwrap();
-        TcpStream::connect(addr2).await.unwrap();
+    #[test]
+    fn test_add_listener_config_tcp_l4_buffer() {
+        let mut listeners = Listeners::new();
+        let tcp_options = TcpSocketOptions {
+            dscp: Some(10),
+            ..Default::default()
+        };
+        let l4_buffer = L4BufferSettings {
+            read: Some(0),
+            write: None,
+        };
+
+        listeners.add_listener(
+            ListenerConfig::tcp("127.0.0.1:7107")
+                .tcp_socket_options(tcp_options)
+                .l4_buffer(l4_buffer),
+        );
+
+        assert_eq!(listeners.stacks.len(), 1);
+        assert_eq!(listeners.stacks[0].l4_buffer, l4_buffer);
+        assert_eq!(listeners.stacks[0].l4_buffer.read_capacity(), 0);
+        assert_eq!(
+            listeners.stacks[0].l4_buffer.write_capacity(),
+            DEFAULT_L4_WRITE_BUFFER_SIZE
+        );
+
+        match &listeners.stacks[0].l4 {
+            ServerAddress::Tcp(addr, Some(options)) => {
+                assert_eq!(addr, "127.0.0.1:7107");
+                assert_eq!(options.dscp, Some(10));
+            }
+            other => panic!("unexpected listener address: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_add_listener_config_uds_l4_buffer() {
+        let mut listeners = Listeners::new();
+        let l4_buffer = L4BufferSettings::unbuffered();
+
+        listeners.add_listener(ListenerConfig::uds("/tmp/test_builder_uds").l4_buffer(l4_buffer));
+
+        assert_eq!(listeners.stacks.len(), 1);
+        assert_eq!(listeners.stacks[0].l4_buffer, l4_buffer);
+        assert_eq!(listeners.stacks[0].l4_buffer.read_capacity(), 0);
+        assert_eq!(listeners.stacks[0].l4_buffer.write_capacity(), 0);
+
+        match &listeners.stacks[0].l4 {
+            ServerAddress::Uds(addr, None) => assert_eq!(addr, "/tmp/test_builder_uds"),
+            other => panic!("unexpected listener address: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_l4_buffer_settings_defaults_per_direction() {
+        let l4_buffer = L4BufferSettings {
+            read: None,
+            write: Some(0),
+        };
+
+        assert_eq!(l4_buffer.read_capacity(), DEFAULT_L4_READ_BUFFER_SIZE);
+        assert_eq!(l4_buffer.write_capacity(), 0);
     }
 
     #[tokio::test]
@@ -602,9 +854,8 @@ mod test {
                 .await
                 .unwrap();
         });
-        // make sure the above starts before the lines below
-        sleep(Duration::from_millis(10)).await;
-
+        // The listener is already bound, so the kernel accepts connections
+        // into the backlog immediately. No readiness wait needed.
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()

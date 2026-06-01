@@ -256,22 +256,55 @@ impl RequestHeader {
     /// Generally prefer [Self::set_uri()] to modify the header's URI if able.
     ///
     /// This API is to allow supporting non UTF-8 cases.
+    ///
+    /// Accepts every URI form HTTP/1.1 request-lines can carry
+    /// (RFC 9112 § 3.2): origin-form (`/path?query`), absolute-form
+    /// (`http://host/path`), authority-form (`host:port`, used by
+    /// CONNECT per RFC 9110 § 9.3.6), and asterisk-form (`*`, used by
+    /// OPTIONS).
+    ///
+    /// Resolution order for the structured `base.uri`:
+    /// 1. `Uri::builder().path_and_query(...)` — origin-form, the hot
+    ///    path for ~all traffic.
+    /// 2. `Uri::try_from(...)` — authority / absolute / asterisk forms
+    ///    (CONNECT request-lines land here).
+    /// 3. Neither parses (e.g. a bare `\` path: valid UTF-8 but not a
+    ///    structurally valid URI — `http >= 1.4` rejects paths that
+    ///    don't start with `/`, where `http <= 1.3` accepted them).
+    ///    Rather than reject the request, preserve the raw bytes in
+    ///    `raw_path_fallback` (the same mechanism the non-UTF8 branch
+    ///    already uses) and set a `/` sentinel on `base.uri` so the
+    ///    structured URI stays valid. `raw_path()` and the H1 wire
+    ///    serializer read `raw_path_fallback` first, so the original
+    ///    bytes still round-trip verbatim.
     pub fn set_raw_path(&mut self, path: &[u8]) -> Result<()> {
-        if let Ok(p) = std::str::from_utf8(path) {
-            let uri = Uri::builder()
+        fn parse(p: &str) -> Option<Uri> {
+            // origin-form first, then authority/absolute/asterisk forms.
+            Uri::builder()
                 .path_and_query(p)
                 .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))?;
-            self.base.uri = uri;
-            // keep raw_path empty, no need to store twice
+                .ok()
+                .or_else(|| Uri::try_from(p).ok())
+        }
+        // Sentinel for paths that are valid UTF-8 (or lossy-decodable)
+        // but not structurally valid URIs; the real bytes live in
+        // raw_path_fallback.
+        const SENTINEL: &str = "/";
+        if let Ok(p) = std::str::from_utf8(path) {
+            match parse(p) {
+                Some(uri) => {
+                    self.base.uri = uri;
+                    // keep raw_path empty, no need to store twice
+                }
+                None => {
+                    self.base.uri = Uri::from_static(SENTINEL);
+                    self.raw_path_fallback = path.to_vec();
+                }
+            }
         } else {
-            // put a valid utf-8 path into base for read only access
+            // Non-UTF8: keep a readable base URI, preserve raw bytes.
             let lossy_str = String::from_utf8_lossy(path);
-            let uri = Uri::builder()
-                .path_and_query(lossy_str.as_ref())
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", lossy_str))?;
-            self.base.uri = uri;
+            self.base.uri = parse(lossy_str.as_ref()).unwrap_or_else(|| Uri::from_static(SENTINEL));
             self.raw_path_fallback = path.to_vec();
         }
         Ok(())
@@ -294,18 +327,21 @@ impl RequestHeader {
     /// Return the request path in its raw format
     ///
     /// Non-UTF8 is supported.
+    ///
+    /// For authority-form request URIs (RFC 9110 § 9.3.6 / CONNECT)
+    /// `Uri::path_and_query()` returns `None`; we fall back to the
+    /// raw authority bytes (e.g. `pingora.org:443`). For asterisk-form
+    /// (OPTIONS *) both `path_and_query` and `authority` are absent
+    /// — return an empty slice rather than panic.
     pub fn raw_path(&self) -> &[u8] {
         if !self.raw_path_fallback.is_empty() {
             &self.raw_path_fallback
+        } else if let Some(pq) = self.base.uri.path_and_query() {
+            pq.as_str().as_bytes()
+        } else if let Some(auth) = self.base.uri.authority() {
+            auth.as_str().as_bytes()
         } else {
-            // Url should always be set
-            self.base
-                .uri
-                .path_and_query()
-                .as_ref()
-                .unwrap()
-                .as_str()
-                .as_bytes()
+            &[]
         }
     }
 
@@ -816,9 +852,10 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         req.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"foo: Bar\r\n");
-        req.case_header_iter().for_each(|(_, _)| {
-            unreachable!("request has no case");
-        });
+        assert!(
+            req.case_header_iter().next().is_none(),
+            "request has no case"
+        );
 
         let mut resp = ResponseHeader::new_no_case(None);
         resp.insert_header("foo", "bar").unwrap();
@@ -826,9 +863,10 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"foo: Bar\r\n");
-        resp.case_header_iter().for_each(|(_, _)| {
-            unreachable!("response has no case");
-        });
+        assert!(
+            resp.case_header_iter().next().is_none(),
+            "response has no case"
+        );
     }
 
     #[test]

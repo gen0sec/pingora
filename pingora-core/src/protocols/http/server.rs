@@ -457,6 +457,22 @@ impl Session {
         }
     }
 
+    /// Controls behaviour when the client closes the connection after the request body.
+    ///
+    /// When **enabled** (default), a client close is returned as a `ConnectionClosed`
+    /// error so the proxy aborts immediately. When **disabled**, `read_body_or_idle`
+    /// stays pending so the proxy can finish delivering the upstream response.
+    ///
+    /// Only meaningful for H1 (TCP). Noop for H2/subrequest/custom.
+    pub fn set_abort_on_close(&mut self, abort: bool) {
+        match self {
+            Self::H1(s) => s.set_abort_on_close(abort),
+            Self::H2(_) => {}
+            Self::Subrequest(_) => {}
+            Self::Custom(_) => {}
+        }
+    }
+
     /// Return a digest of the request including the method, path and Host header
     // TODO: make this use a `Formatter`
     pub fn request_summary(&self) -> String {
@@ -793,6 +809,74 @@ impl Session {
             Self::H2(_) => None,
             Self::Subrequest(_) => None,
             Self::Custom(_) => None,
+        }
+    }
+
+    /// Check if this session supports the cancel-safe proxy task API.
+    ///
+    /// Currently supported by HTTP/1.x and Subrequest server sessions;
+    /// toggled per-session via [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
+    pub fn supports_proxy_task_api(&self) -> bool {
+        match self {
+            Self::H1(s) => s.proxy_tasks_enabled(),
+            Self::Subrequest(s) => s.proxy_tasks_enabled(),
+            Self::H2(_) => false,
+            Self::Custom(_) => false,
+        }
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+        match self {
+            Self::H1(s) => s.set_proxy_tasks_enabled(enabled),
+            Self::Subrequest(s) => s.set_proxy_tasks_enabled(enabled),
+            Self::H2(_) => {}
+            Self::Custom(_) => {}
+        }
+    }
+
+    /// Queue a downstream proxy task for cancel-safe writing.
+    ///
+    /// # Panics
+    /// Panics if called on a session that doesn't support the proxy task API.
+    /// Check [`supports_proxy_task_api`](Self::supports_proxy_task_api) first,
+    /// or use `write_response_header()` / `write_response_body()` for other
+    /// session types.
+    pub fn send_downstream_proxy_task(&mut self, task: HttpTask) {
+        match self {
+            Self::H1(s) => s.send_proxy_task(task),
+            Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
+            Self::Subrequest(s) => s.send_proxy_task(task),
+            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
+        }
+    }
+
+    /// Check if there are pending downstream proxy tasks queued for writing.
+    ///
+    /// Returns false for sessions that don't support the proxy task API.
+    pub fn has_pending_downstream_proxy_tasks(&self) -> bool {
+        match self {
+            Self::H1(s) => s.has_pending_proxy_tasks(),
+            Self::H2(_) => false, // TODO: implement for H2
+            Self::Subrequest(s) => s.has_pending_proxy_tasks(),
+            Self::Custom(_) => false, // TODO: implement for custom
+        }
+    }
+
+    /// Write all queued downstream proxy tasks in a cancel-safe manner.
+    /// Returns `Ok(true)` if this was the end of the response stream.
+    ///
+    /// # Panics
+    /// Panics if called on a session that doesn't support the proxy task API.
+    /// Check [`supports_proxy_task_api`](Self::supports_proxy_task_api) first,
+    /// or use `write_response_header()` / `write_response_body()` for other
+    /// session types.
+    pub async fn write_downstream_proxy_tasks(&mut self) -> Result<bool> {
+        match self {
+            Self::H1(s) => s.write_proxy_tasks().await,
+            Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
+            Self::Subrequest(s) => s.write_proxy_tasks().await,
+            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
         }
     }
 }

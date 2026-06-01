@@ -26,6 +26,12 @@ use crate::protocols::l4::stream::Stream;
 /// Re-export the parsed header type from the underlying `proxy_protocol` crate for convenience.
 pub use proxy_protocol::ProxyHeader;
 
+/// Re-export the v2 extension TLV enum so callers of
+/// `set_proxy_v2_tlv_callback` (registered in `listeners::mod`) can
+/// pattern-match on `ExtensionTlv::Custom { type_id, value }` for
+/// application-defined TLVs in the `0xE0..=0xEF` range.
+pub use proxy_protocol::version2::ExtensionTlv;
+
 /// Maximum number of bytes a PROXY protocol v1 header can occupy, including CRLF.
 pub const MAX_PROXY_V1_HEADER_LEN: usize = 108;
 /// Maximum number of bytes a PROXY protocol v2 header can occupy (16 bytes header + 64k body).

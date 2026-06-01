@@ -23,12 +23,16 @@ group: webusers
 | threads | number of threads per service | number |
 | user | the user the pingora server should be run under after daemonization | string |
 | group | the group the pingora server should be run under after daemonization | string |
+| working_directory | the working directory for the daemonized process | string |
 | client_bind_to_ipv4 | source IPv4 addresses to bind to when connecting to server | list of string |
 | client_bind_to_ipv6 | source IPv6 addresses to bind to when connecting to server| list of string |
 | ca_file | The path to the root CA file | string |
 | s2n_config_cache_size | The maximum number of unique s2n configs to cache. A value of 0 disables the cache. Default: 10 (s2n-tls only) | number |
 | work_stealing | Enable work stealing runtime (default true). See Pingora runtime (WIP) section for more info | bool |
 | upstream_keepalive_pool_size | The number of total connections to keep in the connection pool | number |
+| daemon_wait_for_ready | When `true` and `daemon` is `true`, the parent process waits for the daemon to signal readiness (via `SIGUSR1`) before exiting. This causes systemd to delay sending `SIGQUIT` to the old process until the new instance is fully bootstrapped. Default: `false` | bool |
+| daemon_ready_timeout_seconds | How long (in seconds) the parent waits for the daemon to signal readiness when `daemon_wait_for_ready` is `true`. If the daemon does not signal in time the parent exits with a non-zero code, causing systemd to abort the reload. Default: `600` | number |
+| daemon_notify_timeout_seconds | How long (in seconds) the daemon retries sending `SIGUSR1` to the parent when the attempt fails with a permission error. This covers the brief window after the fork where the parent has not yet dropped its UID to match the daemon. Default: `60` | number |
 
 ## Extension
 Any unknown settings will be ignored. This allows extending the conf file to add and pass user defined settings. See User defined configuration section.
