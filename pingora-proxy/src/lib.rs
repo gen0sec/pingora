@@ -46,7 +46,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -119,6 +119,8 @@ where
     pub server_options: Option<HttpServerOptions>,
     pub h2_options: Option<H2Options>,
     pub downstream_modules: HttpModules,
+    #[cfg(feature = "upstream_modules")]
+    pub upstream_modules: HttpModules,
     max_retries: usize,
     process_custom_session: Option<ProcessCustomSession<SV, C>>,
 }
@@ -153,6 +155,8 @@ impl<SV> HttpProxy<SV, ()> {
             server_options: None,
             h2_options: None,
             downstream_modules: HttpModules::new(),
+            #[cfg(feature = "upstream_modules")]
+            upstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
             process_custom_session: None,
         }
@@ -184,10 +188,23 @@ where
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options,
             downstream_modules: HttpModules::new(),
+            #[cfg(feature = "upstream_modules")]
+            upstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
             process_custom_session: on_custom,
             h2_options: None,
         }
+    }
+
+    /// Return the number of times a pooled upstream connection was found to contain
+    /// unexpected data from the server.
+    pub fn unexpected_data_connection_count(&self) -> u64 {
+        self.client_upstream.unexpected_data_connection_count()
+    }
+
+    /// Return a shared reference to the unexpected data connection counter for periodic metric reporting.
+    pub fn unexpected_data_connection_counter(&self) -> Arc<AtomicU64> {
+        self.client_upstream.unexpected_data_connection_counter()
     }
 
     /// Initialize the downstream modules for this proxy.
@@ -204,6 +221,8 @@ where
     {
         self.inner
             .init_downstream_modules(&mut self.downstream_modules);
+        #[cfg(feature = "upstream_modules")]
+        self.inner.init_upstream_modules(&mut self.upstream_modules);
     }
 
     async fn handle_new_request(
@@ -464,6 +483,10 @@ pub struct Session {
     pub subrequest_spawner: Option<SubrequestSpawner>,
     // Downstream filter modules
     pub downstream_modules_ctx: HttpModuleCtx,
+    /// Upstream filter modules. These run before `upstream_compression` and see the raw
+    /// (pre-compression) upstream response body.
+    #[cfg(feature = "upstream_modules")]
+    pub upstream_modules_ctx: HttpModuleCtx,
     /// Upstream response body bytes received (payload only). Set by proxy layer.
     /// TODO: move this into an upstream session digest for future fields.
     upstream_body_bytes_received: usize,
@@ -477,6 +500,7 @@ impl Session {
     fn new(
         downstream_session: impl Into<Box<HttpSession>>,
         downstream_modules: &HttpModules,
+        #[cfg(feature = "upstream_modules")] upstream_modules: &HttpModules,
         shutdown_flag: Arc<AtomicBool>,
     ) -> Self {
         Session {
@@ -489,6 +513,8 @@ impl Session {
             subrequest_ctx: None,
             subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
+            #[cfg(feature = "upstream_modules")]
+            upstream_modules_ctx: upstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
             upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
@@ -504,6 +530,8 @@ impl Session {
         Self::new(
             Box::new(HttpSession::new_http1(stream)),
             &modules,
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
             Arc::new(AtomicBool::new(false)),
         )
     }
@@ -516,8 +544,45 @@ impl Session {
         Self::new(
             Box::new(HttpSession::new_http1(stream)),
             downstream_modules,
+            #[cfg(feature = "upstream_modules")]
+            &HttpModules::new(),
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    /// Run upstream module filters on the given [`HttpTask`].
+    ///
+    /// Upstream modules process each task **before** `upstream_compression` and
+    /// see the raw (pre-compression) upstream response. Like the downstream
+    /// module path, `response_trailer_filter` and `response_done_filter` return
+    /// values are converted to body tasks when present.
+    #[cfg(feature = "upstream_modules")]
+    pub async fn upstream_modules_filter_task(&mut self, t: &mut HttpTask) -> Result<()> {
+        match t {
+            HttpTask::Header(header, eos) => {
+                self.upstream_modules_ctx
+                    .response_header_filter(header, *eos)
+                    .await?;
+            }
+            HttpTask::Body(body, eos) | HttpTask::UpgradedBody(body, eos) => {
+                self.upstream_modules_ctx.response_body_filter(body, *eos)?;
+            }
+            HttpTask::Trailer(trailers) => {
+                if let Some(buf) = self
+                    .upstream_modules_ctx
+                    .response_trailer_filter(trailers)?
+                {
+                    *t = HttpTask::Body(Some(buf), true);
+                }
+            }
+            HttpTask::Done => {
+                if let Some(buf) = self.upstream_modules_ctx.response_done_filter()? {
+                    *t = HttpTask::Body(Some(buf), true);
+                }
+            }
+            HttpTask::Failed(_) => {}
+        }
+        Ok(())
     }
 
     pub fn as_downstream_mut(&mut self) -> &mut HttpSession {
@@ -587,57 +652,115 @@ impl Session {
             .await
     }
 
-    pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
-        let mut seen_upgraded = self.was_upgraded();
-        for task in tasks.iter_mut() {
-            match task {
-                HttpTask::Header(resp, end) => {
-                    self.downstream_modules_ctx
-                        .response_header_filter(resp, *end)
-                        .await?;
-                }
-                HttpTask::Body(data, end) => {
-                    self.downstream_modules_ctx
-                        .response_body_filter(data, *end)?;
-                }
-                HttpTask::UpgradedBody(data, end) => {
-                    seen_upgraded = true;
-                    self.downstream_modules_ctx
-                        .response_body_filter(data, *end)?;
-                }
-                HttpTask::Trailer(trailers) => {
-                    if let Some(buf) = self
-                        .downstream_modules_ctx
-                        .response_trailer_filter(trailers)?
-                    {
-                        // Write the trailers into the body if the filter
-                        // returns a buffer.
-                        //
-                        // Note, this will not work if end of stream has already
-                        // been seen or we've written content-length bytes.
-                        // (Trailers should never come after upgraded body)
-                        *task = HttpTask::Body(Some(buf), true);
-                    }
-                }
-                HttpTask::Done => {
-                    // `Done` can be sent in certain response paths to mark end
-                    // of response if not already done via trailers or body with
-                    // end flag set.
-                    // If the filter returns body bytes on Done,
-                    // write them into the response.
+    // Run downstream module response filters on a single task, updating
+    // `seen_upgraded` to track whether an upgrade has been seen. Used by both
+    // `send_downstream_proxy_task` and `write_response_tasks`.
+    async fn downstream_response_task_filter(
+        &mut self,
+        task: &mut HttpTask,
+        seen_upgraded: &mut bool,
+    ) -> Result<()> {
+        match task {
+            HttpTask::Header(resp, end) => {
+                self.downstream_modules_ctx
+                    .response_header_filter(resp, *end)
+                    .await?;
+            }
+            HttpTask::Body(data, end) => {
+                self.downstream_modules_ctx
+                    .response_body_filter(data, *end)?;
+            }
+            HttpTask::UpgradedBody(data, end) => {
+                *seen_upgraded = true;
+                self.downstream_modules_ctx
+                    .response_body_filter(data, *end)?;
+            }
+            HttpTask::Trailer(trailers) => {
+                if let Some(buf) = self
+                    .downstream_modules_ctx
+                    .response_trailer_filter(trailers)?
+                {
+                    // Write the trailers into the body if the filter
+                    // returns a buffer.
                     //
                     // Note, this will not work if end of stream has already
                     // been seen or we've written content-length bytes.
-                    if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
-                        if seen_upgraded {
-                            *task = HttpTask::UpgradedBody(Some(buf), true);
-                        } else {
-                            *task = HttpTask::Body(Some(buf), true);
-                        }
+                    // (Trailers should never come after upgraded body)
+                    *task = HttpTask::Body(Some(buf), true);
+                }
+            }
+            HttpTask::Done => {
+                // `Done` can be sent in certain response paths to mark end
+                // of response if not already done via trailers or body with
+                // end flag set.
+                // If the filter returns body bytes on Done,
+                // write them into the response.
+                //
+                // Note, this will not work if end of stream has already
+                // been seen or we've written content-length bytes.
+                if let Some(buf) = self.downstream_modules_ctx.response_done_filter()? {
+                    if *seen_upgraded {
+                        *task = HttpTask::UpgradedBody(Some(buf), true);
+                    } else {
+                        *task = HttpTask::Body(Some(buf), true);
                     }
                 }
-                _ => { /* Failed */ }
             }
+            _ => { /* Failed */ }
+        }
+        Ok(())
+    }
+
+    /// Queue a downstream proxy task for cancel-safe writing after running
+    /// downstream module filters. This allows decoupling cache writes from
+    /// downstream writes.
+    ///
+    /// Only works with sessions that support the proxy task API (currently H1).
+    ///
+    /// # Panics
+    /// Panics if the session doesn't support the proxy task API.
+    /// Use `write_response_tasks()` for sessions that don't support the proxy task API.
+    pub async fn send_downstream_proxy_task(&mut self, mut task: HttpTask) -> Result<()> {
+        let mut seen_upgraded = self.was_upgraded();
+        self.downstream_response_task_filter(&mut task, &mut seen_upgraded)
+            .await?;
+        self.downstream_session.send_downstream_proxy_task(task);
+        Ok(())
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    ///
+    /// When disabled, the proxy falls back to the blocking `write_response_tasks`
+    /// path. This can be called from request filters to opt out on a per-request
+    /// basis.
+    pub fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+        self.downstream_session.set_proxy_tasks_enabled(enabled);
+    }
+
+    /// Check if there are pending downstream tasks queued for writing.
+    /// Used for backpressure - don't queue more cache tasks if we have pending writes.
+    /// Returns false for sessions that don't support the proxy task API.
+    pub fn has_pending_downstream_tasks(&self) -> bool {
+        self.downstream_session.supports_proxy_task_api()
+            && self.downstream_session.has_pending_downstream_proxy_tasks()
+    }
+
+    /// Write all queued downstream proxy tasks. This is cancel-safe and can be called
+    /// in a select! loop while waiting for upstream tasks.
+    /// For sessions that don't support the proxy task API, this is a no-op.
+    pub async fn write_downstream_proxy_tasks(&mut self) -> Result<bool> {
+        if self.downstream_session.supports_proxy_task_api() {
+            self.downstream_session.write_downstream_proxy_tasks().await
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn write_response_tasks(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
+        let mut seen_upgraded = self.was_upgraded();
+        for task in tasks.iter_mut() {
+            self.downstream_response_task_filter(task, &mut seen_upgraded)
+                .await?;
         }
         self.downstream_session.response_duplex_vec(tasks).await
     }
@@ -1030,6 +1153,8 @@ where
             Some(downstream_session) => Session::new(
                 downstream_session,
                 &self.downstream_modules,
+                #[cfg(feature = "upstream_modules")]
+                &self.upstream_modules,
                 self.shutdown_flag.clone(),
             ),
             None => return, // bad request
@@ -1157,6 +1282,8 @@ where
             Some(downstream_session) => Session::new(
                 downstream_session,
                 &self.downstream_modules,
+                #[cfg(feature = "upstream_modules")]
+                &self.upstream_modules,
                 self.shutdown_flag.clone(),
             ),
             None => return None, // bad request

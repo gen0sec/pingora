@@ -18,19 +18,27 @@ use async_trait::async_trait;
 use log::{debug, error, info};
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex as TokioMutex};
+use tokio::sync::broadcast;
 
 #[cfg(feature = "sentry")]
 use sentry::ClientOptions;
 
 #[cfg(unix)]
+use crate::server::daemon::notify_parent_ready_for_fds;
+#[cfg(unix)]
 use crate::server::ListenFds;
+#[cfg(unix)]
+use std::time::Duration;
 
 use crate::{
     prelude::Opt,
     server::{configuration::ServerConf, ExecutionPhase, ShutdownWatch},
     services::{background::BackgroundService, ServiceReadyNotifier},
 };
+
+/// Default timeout for retrying `SIGUSR1` to the parent when it fails with `EPERM`.
+#[cfg(unix)]
+const DEFAULT_DAEMON_NOTIFY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Service that allows the bootstrap process to be delayed until after
 /// dependencies are ready
@@ -58,7 +66,17 @@ pub struct Bootstrap {
     execution_phase_watch: broadcast::Sender<ExecutionPhase>,
 
     #[cfg(unix)]
-    listen_fds: Option<ListenFds>,
+    listen_fds: ListenFds,
+
+    /// PID of the original parent process to notify via `SIGUSR1` after bootstrap completes.
+    /// Set when [`ServerConf::daemon_wait_for_ready`] is `true`.
+    #[cfg(unix)]
+    notify_parent_pid: Option<u32>,
+
+    /// How long to keep retrying `SIGUSR1` to the parent when it fails with `EPERM`.
+    /// See [`ServerConf::daemon_notify_timeout_seconds`].
+    #[cfg(unix)]
+    daemon_notify_timeout: std::time::Duration,
 
     #[cfg(feature = "sentry")]
     #[cfg_attr(docsrs, doc(cfg(feature = "sentry")))]
@@ -95,7 +113,14 @@ impl Bootstrap {
             upgrade,
             upgrade_sock,
             #[cfg(unix)]
-            listen_fds: None,
+            listen_fds: Arc::new(Mutex::new(Fds::new())),
+            #[cfg(unix)]
+            notify_parent_pid: None,
+            #[cfg(unix)]
+            daemon_notify_timeout: conf
+                .daemon_notify_timeout_seconds
+                .map(|n| Duration::from_secs(n.get()))
+                .unwrap_or(DEFAULT_DAEMON_NOTIFY_TIMEOUT),
             execution_phase_watch: execution_phase_watch.clone(),
             completed: false,
             #[cfg(feature = "sentry")]
@@ -108,6 +133,13 @@ impl Bootstrap {
     #[cfg(feature = "sentry")]
     pub fn set_sentry_config(&mut self, sentry_config: Option<ClientOptions>) {
         self.sentry = sentry_config;
+    }
+
+    /// Store the parent process PID to notify via `SIGUSR1` after bootstrap completes.
+    /// Only relevant when [`ServerConf::daemon_wait_for_ready`] is `true`.
+    #[cfg(unix)]
+    pub fn set_notify_parent_pid(&mut self, pid: u32) {
+        self.notify_parent_pid = Some(pid);
     }
 
     /// Initialize the Sentry client from the configured [`ClientOptions`] and
@@ -161,7 +193,17 @@ impl Bootstrap {
             std::process::exit(0);
         }
 
-        // load fds
+        // Notify the parent process that it can exit. It might seem like we should load the file
+        // descriptors from the old process first, but the purpose of this notification is to
+        // release the parent so that the process managing it (e.g. systemd) can continue and send
+        // a quit signal to the old process. That quit signal is required before the old process
+        // will start trying to send its file descriptors to us — so if we called load_fds first,
+        // we would be guaranteeing a timeout.
+        #[cfg(unix)]
+        if let Some(pid) = self.notify_parent_pid {
+            notify_parent_ready_for_fds(pid, self.daemon_notify_timeout);
+        }
+
         #[cfg(unix)]
         match self.load_fds(self.upgrade) {
             Ok(_) => {
@@ -186,17 +228,18 @@ impl Bootstrap {
 
     #[cfg(unix)]
     fn load_fds(&mut self, upgrade: bool) -> Result<(), nix::Error> {
-        let mut fds = Fds::new();
         if upgrade {
             debug!("Trying to receive socks");
-            fds.get_from_sock(self.upgrade_sock.as_str())?
+            let mut fds = Fds::new();
+            fds.get_from_sock(self.upgrade_sock.as_str())?;
+            // Mutate through the existing Arc so all clones held by services see the update.
+            *self.listen_fds.lock() = fds;
         }
-        self.listen_fds = Some(Arc::new(TokioMutex::new(fds)));
         Ok(())
     }
 
     #[cfg(unix)]
-    pub fn get_fds(&self) -> Option<ListenFds> {
+    pub fn get_fds(&self) -> ListenFds {
         self.listen_fds.clone()
     }
 }

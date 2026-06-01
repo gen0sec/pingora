@@ -47,7 +47,6 @@ strum = "0.26.2"
 strum_macros = "0.26.2"
 libc = "0.2.70"
 chrono = { version = "~0.4.31", features = ["alloc"], default-features = false }
-prometheus = { version = "0.14", optional = true }
 sentry = { version = "0.36", features = [
     "backtrace",
     "contexts",
@@ -79,6 +78,7 @@ daggy = "0.8"
 proxy-protocol = { git = "https://github.com/gen0sec/proxy-protocol.git", tag = "v0.5.3" }
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5.0"
+flurry = "0.5"
 nix = "~0.24.3"
 
 [target.'cfg(windows)'.dependencies]
@@ -88,15 +88,18 @@ windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
 h2 = { workspace = true, features = ["unstable"] }
 tokio-stream = { version = "0.1", features = ["full"] }
 env_logger = "0.11"
-reqwest = { version = "0.11", features = [
+reqwest = { version = "0.12", features = [
     "rustls-tls",
+    "http2",
 ], default-features = false }
-hyper = "0.14"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
+http-body-util = "0.1"
 rstest = "0.23.0"
 rustls = "0.23"
 
 [target.'cfg(unix)'.dev-dependencies]
-hyperlocal = "0.8"
+hyperlocal = "0.9"
 jemallocator = "0.5"
 
 [features]
@@ -110,4 +113,3 @@ openssl_derived = ["any_tls"]
 any_tls = []
 sentry = ["dep:sentry"]
 connection_filter = []
-prometheus = ["dep:prometheus"]

@@ -36,7 +36,7 @@ use std::thread;
 use std::time::SystemTime;
 #[cfg(unix)]
 use tokio::signal::unix;
-use tokio::sync::{broadcast, watch, Mutex as TokioMutex};
+use tokio::sync::{broadcast, watch};
 use tokio::time::{sleep, Duration};
 
 use crate::prelude::background_service;
@@ -131,7 +131,7 @@ pub enum ExecutionPhase {
 /// to shutdown
 pub type ShutdownWatch = watch::Receiver<bool>;
 #[cfg(unix)]
-pub type ListenFds = Arc<TokioMutex<Fds>>;
+pub type ListenFds = Arc<Mutex<Fds>>;
 
 /// The type of shutdown process that has been requested.
 #[derive(Debug)]
@@ -286,43 +286,47 @@ impl Server {
                     .send(ExecutionPhase::GracefulUpgradeTransferringFds)
                     .ok();
 
-                if let Some(fds) = self.listen_fds() {
-                    let fds = fds.lock().await;
-                    info!("Trying to send socks");
-                    // XXX: this is blocking IO
-                    match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
-                        Ok(_) => {
-                            info!("listener sockets sent");
+                let sent_fds = {
+                    let fds = self.listen_fds();
+                    let fds = fds.lock();
+                    if fds.is_empty() {
+                        info!("No socks to send, shutting down.");
+                        false
+                    } else {
+                        info!("Trying to send socks");
+                        match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
+                            Ok(_) => {
+                                info!("listener sockets sent");
+                            }
+                            Err(e) => {
+                                error!("Unable to send listener sockets to new process: {e}");
+                                #[cfg(all(not(debug_assertions), feature = "sentry"))]
+                                sentry::capture_error(&e);
+                            }
                         }
-                        Err(e) => {
-                            error!("Unable to send listener sockets to new process: {e}");
-                            // sentry log error on fd send failure
-                            #[cfg(all(not(debug_assertions), feature = "sentry"))]
-                            sentry::capture_error(&e);
-                        }
+                        true
                     }
+                };
+                if sent_fds {
                     self.execution_phase_watch
                         .send(ExecutionPhase::GracefulUpgradeCloseTimeout)
                         .ok();
                     sleep(Duration::from_secs(CLOSE_TIMEOUT)).await;
-                    info!("Broadcasting graceful shutdown");
-                    // gracefully exiting
-                    match self.shutdown_watch.send(true) {
-                        Ok(_) => {
-                            info!("Graceful shutdown started!");
-                        }
-                        Err(e) => {
-                            error!("Graceful shutdown broadcast failed: {e}");
-                            // switch to fast shutdown
-                            return ShutdownType::Graceful;
-                        }
-                    }
-                    info!("Broadcast graceful shutdown complete");
-                    ShutdownType::Graceful
-                } else {
-                    info!("No socks to send, shutting down.");
-                    ShutdownType::Graceful
                 }
+                info!("Broadcasting graceful shutdown");
+                // gracefully exiting
+                match self.shutdown_watch.send(true) {
+                    Ok(_) => {
+                        info!("Graceful shutdown started!");
+                    }
+                    Err(e) => {
+                        error!("Graceful shutdown broadcast failed: {e}");
+                        // switch to fast shutdown
+                        return ShutdownType::Graceful;
+                    }
+                }
+                info!("Broadcast graceful shutdown complete");
+                ShutdownType::Graceful
             }
         }
     }
@@ -374,14 +378,14 @@ impl Server {
 
     /// Get the configured file descriptors for listening
     #[cfg(unix)]
-    fn listen_fds(&self) -> Option<ListenFds> {
+    fn listen_fds(&self) -> ListenFds {
         self.bootstrap.lock().get_fds()
     }
 
     #[allow(clippy::too_many_arguments)]
     fn run_service(
         mut service: Box<dyn ServiceWithDependents>,
-        #[cfg(unix)] fds: Option<ListenFds>,
+        #[cfg(unix)] fds: ListenFds,
         shutdown: ShutdownWatch,
         threads: usize,
         work_stealing: bool,
@@ -420,7 +424,7 @@ impl Server {
             service
                 .start_service(
                     #[cfg(unix)]
-                    fds,
+                    Some(fds),
                     shutdown,
                     listeners_per_fd,
                     ready_notifier,
@@ -636,8 +640,13 @@ impl Server {
         if conf.daemon {
             info!("Daemonizing the server");
             fast_timeout::pause_for_fork();
-            daemonize(&self.configuration);
+            let daemonize_result = daemonize(&self.configuration);
             fast_timeout::unpause();
+            // If daemon_wait_for_ready is enabled, pass the parent PID to bootstrap so it
+            // can send SIGUSR1 to the parent after bootstrap completes.
+            if let Some(pid) = daemonize_result.notify_parent_pid {
+                self.bootstrap.lock().set_notify_parent_pid(pid);
+            }
         }
 
         #[cfg(windows)]

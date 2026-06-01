@@ -25,6 +25,8 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
+use std::num::NonZeroU64;
+use std::path::PathBuf;
 
 // default maximum upstream retries for retry-able proxy errors
 const DEFAULT_MAX_RETRIES: usize = 16;
@@ -63,6 +65,11 @@ pub struct ServerConf {
     pub user: Option<String>,
     /// Similar to `user`, the group this process should switch to.
     pub group: Option<String>,
+    /// Working directory for the daemonized process.
+    ///
+    /// Only applied when `daemon` is `true`; set this to start the daemon from a known cwd.
+    // TODO: other OS path options should likely be `PathBuf` as well.
+    pub working_directory: Option<PathBuf>,
     /// How many threads **each** service should get. The threads are not shared across services.
     pub threads: usize,
     /// Number of listener tasks to use per fd. This allows for parallel accepts.
@@ -129,6 +136,45 @@ pub struct ServerConf {
     ///
     /// When not set, the tokio default (10 seconds) is used.
     pub blocking_threads_ttl_seconds: Option<u64>,
+    /// When `daemon` is `true`, controls whether the parent process of the daemon fork waits for
+    /// the child to signal readiness before exiting.
+    ///
+    /// When `false` (default), the parent exits immediately after the daemon fork, matching the
+    /// traditional daemonization behavior. Systemd will consider the service started as soon as
+    /// the parent exits, which may be before the child has finished bootstrapping.
+    ///
+    /// When `true`, the parent waits (up to [`Self::daemon_ready_timeout_seconds`]) for the child
+    /// to send `SIGUSR1` after bootstrap completes. This causes systemd to delay any subsequent
+    /// steps (such as sending `SIGQUIT` to the old process) until the new instance is fully ready
+    /// to serve traffic. If the child does not signal in time, the parent exits with a non-zero
+    /// exit code, causing systemd to abort the reload.
+    pub daemon_wait_for_ready: bool,
+    /// Timeout in seconds for the parent process to wait for the child to signal readiness during
+    /// daemonization when [`Self::daemon_wait_for_ready`] is `true`.
+    ///
+    /// If the child does not send `SIGUSR1` within this timeout, the parent exits with a non-zero
+    /// exit code.
+    ///
+    /// Defaults to 600 seconds (10 minutes).
+    pub daemon_ready_timeout_seconds: Option<NonZeroU64>,
+    /// How long the child process will keep retrying `SIGUSR1` to the parent when the signal
+    /// fails with a permission error (`EPERM`) during daemonization.
+    ///
+    /// After the daemon fork, the parent always drops its credentials to the configured user and
+    /// group (see [`Self::user`], [`Self::group`]). Because the privilege drop happens after the
+    /// fork, there is a small window where the child may attempt to signal the parent before the
+    /// parent has finished changing its credentials. During this window the kernel will reject the
+    /// signal with `EPERM` because the child and parent are running as different users. The child
+    /// retries every 100 ms until this timeout elapses.
+    ///
+    /// In practice this window is very small, so the default of 60 seconds is far more than
+    /// enough to account for it.
+    ///
+    /// Only retries on `EPERM`; any other error (e.g. `ESRCH` — parent no longer exists) is
+    /// treated as fatal and logged without retrying.
+    ///
+    /// Defaults to 60 seconds.
+    pub daemon_notify_timeout_seconds: Option<NonZeroU64>,
 }
 
 impl Default for ServerConf {
@@ -148,6 +194,7 @@ impl Default for ServerConf {
             upgrade_sock: "/tmp/pingora_upgrade.sock".to_string(),
             user: None,
             group: None,
+            working_directory: None,
             threads: 1,
             listener_tasks_per_fd: 1,
             work_stealing: true,
@@ -160,6 +207,9 @@ impl Default for ServerConf {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            daemon_ready_timeout_seconds: None,
+            daemon_wait_for_ready: false,
+            daemon_notify_timeout_seconds: None,
         }
     }
 }
@@ -320,6 +370,7 @@ mod tests {
             upgrade_sock: "".to_string(),
             user: None,
             group: None,
+            working_directory: None,
             threads: 1,
             listener_tasks_per_fd: 1,
             work_stealing: true,
@@ -332,6 +383,9 @@ mod tests {
             upgrade_sock_connect_accept_max_retries: None,
             max_blocking_threads: None,
             blocking_threads_ttl_seconds: None,
+            daemon_ready_timeout_seconds: None,
+            daemon_wait_for_ready: false,
+            daemon_notify_timeout_seconds: None,
         };
         // cargo test -- --nocapture not_a_test_i_cannot_write_yaml_by_hand
         println!("{}", conf.to_yaml());
@@ -370,6 +424,29 @@ version: 1
         assert_eq!(DEFAULT_MAX_RETRIES, conf.max_retries);
         assert_eq!("/tmp/pingora.pid", conf.pid_file);
         assert!(!conf.enable_proxy_protocol);
+    }
+
+    #[test]
+    fn test_working_directory_deserializes_from_yaml_string() {
+        init_log();
+        let conf_str = r#"
+---
+version: 1
+daemon: true
+working_directory: /var/lib/pingora
+        "#;
+
+        let conf = ServerConf::from_yaml(conf_str).unwrap();
+        assert_eq!(
+            conf.working_directory.as_deref(),
+            Some(std::path::Path::new("/var/lib/pingora"))
+        );
+
+        let yaml = serde_yaml::to_value(&conf).unwrap();
+        assert_eq!(
+            yaml.get("working_directory"),
+            Some(&serde_yaml::Value::String("/var/lib/pingora".to_string()))
+        );
     }
 
     #[test]
