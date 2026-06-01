@@ -162,7 +162,7 @@ static PROXY_V2_TLV_CALLBACK: std::sync::OnceLock<std::sync::Mutex<ProxyV2TlvCal
 ///     for tlv in tlvs {
 ///         if let ExtensionTlv::Custom { type_id: 0xE0, value } = tlv {
 ///             // Application-defined TLV — decode and act on it.
-///             let _ = (real_addr, value);
+///             let _ = (&real_addr, value);
 ///         }
 ///     }
 /// }));

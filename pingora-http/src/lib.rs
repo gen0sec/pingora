@@ -263,32 +263,48 @@ impl RequestHeader {
     /// CONNECT per RFC 9110 § 9.3.6), and asterisk-form (`*`, used by
     /// OPTIONS).
     ///
-    /// Tries the permissive origin-form path
-    /// (`Uri::builder().path_and_query(...)`) first — that's the
-    /// hot path for ~all traffic and accepts looser byte sequences
-    /// than `Uri::try_from` does (callers had been relying on that
-    /// for paths containing characters like `\`). When the origin
-    /// builder rejects the input, falls back to `Uri::try_from`,
-    /// which auto-detects authority / absolute / asterisk forms so
-    /// CONNECT request-lines parse cleanly. Both failing surfaces
-    /// `InvalidHTTPHeader`.
+    /// Resolution order for the structured `base.uri`:
+    /// 1. `Uri::builder().path_and_query(...)` — origin-form, the hot
+    ///    path for ~all traffic.
+    /// 2. `Uri::try_from(...)` — authority / absolute / asterisk forms
+    ///    (CONNECT request-lines land here).
+    /// 3. Neither parses (e.g. a bare `\` path: valid UTF-8 but not a
+    ///    structurally valid URI — `http >= 1.4` rejects paths that
+    ///    don't start with `/`, where `http <= 1.3` accepted them).
+    ///    Rather than reject the request, preserve the raw bytes in
+    ///    `raw_path_fallback` (the same mechanism the non-UTF8 branch
+    ///    already uses) and set a `/` sentinel on `base.uri` so the
+    ///    structured URI stays valid. `raw_path()` and the H1 wire
+    ///    serializer read `raw_path_fallback` first, so the original
+    ///    bytes still round-trip verbatim.
     pub fn set_raw_path(&mut self, path: &[u8]) -> Result<()> {
-        fn parse(p: &str) -> Result<Uri> {
-            // Permissive origin-form first — preserves the
-            // pre-CONNECT-fix behaviour for byte-permissive paths.
-            if let Ok(uri) = Uri::builder().path_and_query(p).build() {
-                return Ok(uri);
-            }
-            // Authority-form (CONNECT) / absolute-form / asterisk-form.
-            Uri::try_from(p).explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))
+        fn parse(p: &str) -> Option<Uri> {
+            // origin-form first, then authority/absolute/asterisk forms.
+            Uri::builder()
+                .path_and_query(p)
+                .build()
+                .ok()
+                .or_else(|| Uri::try_from(p).ok())
         }
+        // Sentinel for paths that are valid UTF-8 (or lossy-decodable)
+        // but not structurally valid URIs; the real bytes live in
+        // raw_path_fallback.
+        const SENTINEL: &str = "/";
         if let Ok(p) = std::str::from_utf8(path) {
-            self.base.uri = parse(p)?;
-            // keep raw_path empty, no need to store twice
+            match parse(p) {
+                Some(uri) => {
+                    self.base.uri = uri;
+                    // keep raw_path empty, no need to store twice
+                }
+                None => {
+                    self.base.uri = Uri::from_static(SENTINEL);
+                    self.raw_path_fallback = path.to_vec();
+                }
+            }
         } else {
-            // put a valid utf-8 path into base for read only access
+            // Non-UTF8: keep a readable base URI, preserve raw bytes.
             let lossy_str = String::from_utf8_lossy(path);
-            self.base.uri = parse(lossy_str.as_ref())?;
+            self.base.uri = parse(lossy_str.as_ref()).unwrap_or_else(|| Uri::from_static(SENTINEL));
             self.raw_path_fallback = path.to_vec();
         }
         Ok(())
@@ -836,9 +852,10 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         req.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"foo: Bar\r\n");
-        req.case_header_iter().for_each(|(_, _)| {
-            unreachable!("request has no case");
-        });
+        assert!(
+            req.case_header_iter().next().is_none(),
+            "request has no case"
+        );
 
         let mut resp = ResponseHeader::new_no_case(None);
         resp.insert_header("foo", "bar").unwrap();
@@ -846,9 +863,10 @@ mod tests {
         let mut buf: Vec<u8> = vec![];
         resp.header_to_h1_wire(&mut buf);
         assert_eq!(buf, b"foo: Bar\r\n");
-        resp.case_header_iter().for_each(|(_, _)| {
-            unreachable!("response has no case");
-        });
+        assert!(
+            resp.case_header_iter().next().is_none(),
+            "response has no case"
+        );
     }
 
     #[test]
