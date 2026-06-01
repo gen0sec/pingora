@@ -140,8 +140,7 @@ fn call_client_hello_callback(
 ///
 /// Signature mirrors `ClientHelloCallback`: a pointer fn so the
 /// registration can stay `Sync` without an `Arc<dyn Fn>` shuffle.
-pub type ProxyV2TlvCallback =
-    Option<fn(&[proxy_protocol::ExtensionTlv], SocketAddr)>;
+pub type ProxyV2TlvCallback = Option<fn(&[proxy_protocol::ExtensionTlv], SocketAddr)>;
 
 /// Global callback for parsed PROXY v2 extension TLVs. Registered by
 /// `set_proxy_v2_tlv_callback`, invoked by `call_proxy_v2_tlv_callback`.
@@ -177,10 +176,7 @@ pub fn set_proxy_v2_tlv_callback(callback: ProxyV2TlvCallback) {
 
 /// Invoke the PROXY v2 TLV callback if registered. No-op when no
 /// callback is set (the common case) or when the TLV list is empty.
-fn call_proxy_v2_tlv_callback(
-    tlvs: &[proxy_protocol::ExtensionTlv],
-    real_addr: SocketAddr,
-) {
+fn call_proxy_v2_tlv_callback(tlvs: &[proxy_protocol::ExtensionTlv], real_addr: SocketAddr) {
     if tlvs.is_empty() {
         return;
     }
