@@ -105,6 +105,11 @@ pub mod utils;
 pub use listeners::set_client_hello_callback;
 pub use listeners::ClientHelloCallback;
 
+// Re-export PROXY v2 extension-TLV callback for app-defined metadata
+// (e.g. synapse's per-flow fingerprint store, see gen0sec/synapse#352).
+pub use listeners::set_proxy_v2_tlv_callback;
+pub use listeners::ProxyV2TlvCallback;
+
 pub use pingora_error::{ErrorType::*, *};
 
 // If both openssl and boringssl are enabled, prefer boringssl.

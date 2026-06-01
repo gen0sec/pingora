@@ -129,6 +129,70 @@ fn call_client_hello_callback(
     }
 }
 
+/// Callback function type for parsed PROXY protocol v2 extension TLVs.
+///
+/// Invoked from `UninitializedStream::handshake` right after
+/// `maybe_consume_proxy_header` parses a v2 header and recovers the
+/// real client `SocketAddr`. Lets consumer applications (synapse,
+/// custom logging) pull metadata out of application-defined TLVs
+/// (HAProxy spec § 2.2 reserves type IDs `0xE0..=0xEF`) without
+/// needing to parse the wire bytes themselves.
+///
+/// Signature mirrors `ClientHelloCallback`: a pointer fn so the
+/// registration can stay `Sync` without an `Arc<dyn Fn>` shuffle.
+pub type ProxyV2TlvCallback =
+    Option<fn(&[proxy_protocol::ExtensionTlv], SocketAddr)>;
+
+/// Global callback for parsed PROXY v2 extension TLVs. Registered by
+/// `set_proxy_v2_tlv_callback`, invoked by `call_proxy_v2_tlv_callback`.
+static PROXY_V2_TLV_CALLBACK: std::sync::OnceLock<std::sync::Mutex<ProxyV2TlvCallback>> =
+    std::sync::OnceLock::new();
+
+/// Register a callback that receives the parsed PROXY v2 extension
+/// TLVs from every accepted connection (in addition to the recovered
+/// source address that `maybe_consume_proxy_header` already plumbs
+/// into the SocketDigest).
+///
+/// # Example
+/// ```
+/// use pingora_core::listeners::set_proxy_v2_tlv_callback;
+/// use pingora_core::protocols::proxy_protocol::ExtensionTlv;
+/// use pingora_core::protocols::l4::socket::SocketAddr;
+///
+/// set_proxy_v2_tlv_callback(Some(|tlvs: &[ExtensionTlv], real_addr: SocketAddr| {
+///     for tlv in tlvs {
+///         if let ExtensionTlv::Custom { type_id: 0xE0, value } = tlv {
+///             // Application-defined TLV — decode and act on it.
+///             let _ = (real_addr, value);
+///         }
+///     }
+/// }));
+/// ```
+pub fn set_proxy_v2_tlv_callback(callback: ProxyV2TlvCallback) {
+    PROXY_V2_TLV_CALLBACK.get_or_init(|| std::sync::Mutex::new(callback));
+    if let Ok(mut cb) = PROXY_V2_TLV_CALLBACK.get().unwrap().lock() {
+        *cb = callback;
+    }
+}
+
+/// Invoke the PROXY v2 TLV callback if registered. No-op when no
+/// callback is set (the common case) or when the TLV list is empty.
+fn call_proxy_v2_tlv_callback(
+    tlvs: &[proxy_protocol::ExtensionTlv],
+    real_addr: SocketAddr,
+) {
+    if tlvs.is_empty() {
+        return;
+    }
+    if let Some(cb_guard) = PROXY_V2_TLV_CALLBACK.get() {
+        if let Ok(cb) = cb_guard.lock() {
+            if let Some(callback) = *cb {
+                callback(tlvs, real_addr);
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 use crate::server::ListenFds;
 
@@ -367,7 +431,8 @@ impl UninitializedStream {
 
         match proxy_protocol::consume_proxy_header(&mut self.l4).await {
             Ok(Some(header)) => {
-                if let Some(real_addr) = proxy_protocol::source_addr_from_header(&header) {
+                let real_addr_opt = proxy_protocol::source_addr_from_header(&header);
+                if let Some(real_addr) = real_addr_opt {
                     if let Some(digest) = self.l4.get_socket_digest() {
                         let client_addr = SocketAddr::Inet(real_addr);
                         digest.set_client_addr(client_addr.clone());
@@ -384,6 +449,19 @@ impl UninitializedStream {
                     warn!("PROXY protocol header lacked a usable client address");
                 } else {
                     debug!("PROXY protocol header contained no client address (LOCAL command)");
+                }
+                // Surface any v2 extension TLVs to the registered
+                // application callback so consumers can ride extra
+                // metadata (e.g. JA4 fingerprints) on the same hop
+                // without an out-of-band channel. We need the real
+                // source address as the key, so skip when source
+                // recovery failed.
+                if let Some(real_addr) = real_addr_opt {
+                    if let proxy_protocol::ProxyHeader::Version2 { extensions, .. } = &header {
+                        if !extensions.is_empty() {
+                            call_proxy_v2_tlv_callback(extensions, SocketAddr::Inet(real_addr));
+                        }
+                    }
                 }
             }
             Ok(None) => {
