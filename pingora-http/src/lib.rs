@@ -256,22 +256,39 @@ impl RequestHeader {
     /// Generally prefer [Self::set_uri()] to modify the header's URI if able.
     ///
     /// This API is to allow supporting non UTF-8 cases.
+    ///
+    /// Accepts every URI form HTTP/1.1 request-lines can carry
+    /// (RFC 9112 § 3.2): origin-form (`/path?query`), absolute-form
+    /// (`http://host/path`), authority-form (`host:port`, used by
+    /// CONNECT per RFC 9110 § 9.3.6), and asterisk-form (`*`, used by
+    /// OPTIONS).
+    ///
+    /// Tries the permissive origin-form path
+    /// (`Uri::builder().path_and_query(...)`) first — that's the
+    /// hot path for ~all traffic and accepts looser byte sequences
+    /// than `Uri::try_from` does (callers had been relying on that
+    /// for paths containing characters like `\`). When the origin
+    /// builder rejects the input, falls back to `Uri::try_from`,
+    /// which auto-detects authority / absolute / asterisk forms so
+    /// CONNECT request-lines parse cleanly. Both failing surfaces
+    /// `InvalidHTTPHeader`.
     pub fn set_raw_path(&mut self, path: &[u8]) -> Result<()> {
+        fn parse(p: &str) -> Result<Uri> {
+            // Permissive origin-form first — preserves the
+            // pre-CONNECT-fix behaviour for byte-permissive paths.
+            if let Ok(uri) = Uri::builder().path_and_query(p).build() {
+                return Ok(uri);
+            }
+            // Authority-form (CONNECT) / absolute-form / asterisk-form.
+            Uri::try_from(p).explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))
+        }
         if let Ok(p) = std::str::from_utf8(path) {
-            let uri = Uri::builder()
-                .path_and_query(p)
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))?;
-            self.base.uri = uri;
+            self.base.uri = parse(p)?;
             // keep raw_path empty, no need to store twice
         } else {
             // put a valid utf-8 path into base for read only access
             let lossy_str = String::from_utf8_lossy(path);
-            let uri = Uri::builder()
-                .path_and_query(lossy_str.as_ref())
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", lossy_str))?;
-            self.base.uri = uri;
+            self.base.uri = parse(lossy_str.as_ref())?;
             self.raw_path_fallback = path.to_vec();
         }
         Ok(())
@@ -294,18 +311,21 @@ impl RequestHeader {
     /// Return the request path in its raw format
     ///
     /// Non-UTF8 is supported.
+    ///
+    /// For authority-form request URIs (RFC 9110 § 9.3.6 / CONNECT)
+    /// `Uri::path_and_query()` returns `None`; we fall back to the
+    /// raw authority bytes (e.g. `pingora.org:443`). For asterisk-form
+    /// (OPTIONS *) both `path_and_query` and `authority` are absent
+    /// — return an empty slice rather than panic.
     pub fn raw_path(&self) -> &[u8] {
         if !self.raw_path_fallback.is_empty() {
             &self.raw_path_fallback
+        } else if let Some(pq) = self.base.uri.path_and_query() {
+            pq.as_str().as_bytes()
+        } else if let Some(auth) = self.base.uri.authority() {
+            auth.as_str().as_bytes()
         } else {
-            // Url should always be set
-            self.base
-                .uri
-                .path_and_query()
-                .as_ref()
-                .unwrap()
-                .as_str()
-                .as_bytes()
+            &[]
         }
     }
 
