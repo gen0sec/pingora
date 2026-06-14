@@ -24,6 +24,35 @@ mod boringssl_openssl;
 #[cfg(feature = "openssl_derived")]
 pub use boringssl_openssl::*;
 
+/// Stash the PROXY-protocol-recovered client address on the TLS `SSL` object so
+/// it is reachable from a `certificate_callback` during the handshake — the
+/// only handshake hook a consumer can plug into that also sees the raw `SSL*`
+/// for HTTP/2 connections (the `SslStream` isn't reachable on the h2 request
+/// path). The server handshake sets it just before invoking the cert callback;
+/// the consumer reads it back via the same ex_data index.
+#[cfg(feature = "openssl_derived")]
+pub mod client_addr_ex {
+    use crate::tls::ex_data::Index;
+    use crate::tls::ssl::{Ssl, SslRef};
+    use std::net::SocketAddr;
+    use std::sync::OnceLock;
+
+    fn index() -> Index<Ssl, SocketAddr> {
+        static IDX: OnceLock<Index<Ssl, SocketAddr>> = OnceLock::new();
+        *IDX.get_or_init(|| Ssl::new_ex_index().expect("Ssl::new_ex_index for client addr"))
+    }
+
+    /// Stash the recovered client address on the SSL object (handshake side).
+    pub fn set(ssl: &mut SslRef, addr: SocketAddr) {
+        ssl.set_ex_data(index(), addr);
+    }
+
+    /// Read the recovered client address back (cert-callback / consumer side).
+    pub fn get(ssl: &SslRef) -> Option<SocketAddr> {
+        ssl.ex_data(index()).copied()
+    }
+}
+
 #[cfg(feature = "rustls")]
 mod rustls;
 

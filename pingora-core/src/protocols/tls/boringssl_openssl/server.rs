@@ -16,6 +16,7 @@
 
 use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::SslStream;
+use crate::protocols::GetSocketDigest;
 use crate::protocols::{Shutdown, IO};
 use crate::tls::ext;
 use crate::tls::ext::ssl_from_acceptor;
@@ -57,8 +58,19 @@ pub async fn handshake_with_callback<S: IO>(
         .await
         .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
     if !done {
+        // Stash the PROXY-protocol-recovered client address on the SSL object
+        // BEFORE the cert callback, so a consumer's certificate_callback can read
+        // the real client IP even for HTTP/2 (where the SslStream isn't reachable
+        // on the request path). peer_addr() returns the recovered addr once the
+        // SocketDigest has been patched by maybe_consume_proxy_header.
+        let recovered_client = tls_stream
+            .get_socket_digest()
+            .and_then(|d| d.peer_addr().and_then(|a| a.as_inet().copied()));
         // safety: we do hold a mut ref of tls_stream
         let ssl_mut = unsafe { ext::ssl_mut(tls_stream.ssl()) };
+        if let Some(addr) = recovered_client {
+            crate::protocols::tls::client_addr_ex::set(ssl_mut, addr);
+        }
         callbacks.certificate_callback(ssl_mut).await;
         Pin::new(&mut tls_stream)
             .resume_accept()
