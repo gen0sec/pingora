@@ -64,6 +64,12 @@ rand = "0.8"
 ahash = { workspace = true }
 unicase = "2"
 brotli = "3"
+# Resolver constraint (not used directly): brotli's StandardAlloc comes from
+# alloc-stdlib. alloc-stdlib 0.2.3 pulls alloc-no-stdlib 3.0.0, which coexists
+# with brotli/brotli-decompressor's 2.0.x as two incompatible `Allocator` traits
+# and breaks the build (`StandardAlloc: Allocator not satisfied`). Pin
+# alloc-stdlib 0.2.2 so a single alloc-no-stdlib (2.0.4) resolves.
+alloc-stdlib = "=0.2.2"
 openssl-probe = "0.1.6"
 tokio-test = "0.4"
 zstd = "0"
