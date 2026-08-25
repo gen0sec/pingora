@@ -96,6 +96,16 @@ impl Session {
         matches!(self, Self::Custom(_))
     }
 
+    /// Return a stable, human-readable label for this downstream session type.
+    pub fn session_type(&self) -> &'static str {
+        match self {
+            Self::H1(_) => "h1",
+            Self::H2(_) => "h2",
+            Self::Subrequest(_) => "subrequest",
+            Self::Custom(_) => "custom",
+        }
+    }
+
     /// Read the request header. This method is required to be called first before doing anything
     /// else with the session.
     /// - `Ok(true)`: successful
@@ -766,6 +776,26 @@ impl Session {
         }
     }
 
+    /// Return whether this response completes an upgrade handshake.
+    ///
+    /// Returns `Some(true)` when an upgrade request gets an upgrade response,
+    /// `Some(false)` when an upgrade request gets a non-upgrade response, and
+    /// `None` when this request is not an upgrade.
+    pub fn is_upgrade(&self, header: &ResponseHeader) -> Option<bool> {
+        match self {
+            Self::H1(s) => s.is_upgrade(header),
+            Self::H2(_) => None,
+            Self::Subrequest(s) => s.is_upgrade(header),
+            Self::Custom(s) => {
+                if s.is_upgrade_req() {
+                    Some(super::v1::common::is_upgrade_resp(header))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// Whether this session was fully upgraded (completed Upgrade handshake).
     pub fn was_upgraded(&self) -> bool {
         match self {
@@ -851,14 +881,15 @@ impl Session {
 
     /// Check if this session supports the cancel-safe proxy task API.
     ///
-    /// Currently supported by HTTP/1.x and Subrequest server sessions;
-    /// toggled per-session via [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
+    /// Currently supported by HTTP/1.x, Subrequest, and opted-in Custom
+    /// server sessions; toggled per-session via
+    /// [`set_proxy_tasks_enabled`](Self::set_proxy_tasks_enabled).
     pub fn supports_proxy_task_api(&self) -> bool {
         match self {
             Self::H1(s) => s.proxy_tasks_enabled(),
             Self::Subrequest(s) => s.proxy_tasks_enabled(),
+            Self::Custom(s) => s.proxy_tasks_enabled(),
             Self::H2(_) => false,
-            Self::Custom(_) => false,
         }
     }
 
@@ -867,8 +898,8 @@ impl Session {
         match self {
             Self::H1(s) => s.set_proxy_tasks_enabled(enabled),
             Self::Subrequest(s) => s.set_proxy_tasks_enabled(enabled),
+            Self::Custom(s) => s.set_proxy_tasks_enabled(enabled),
             Self::H2(_) => {}
-            Self::Custom(_) => {}
         }
     }
 
@@ -913,12 +944,13 @@ impl Session {
     /// Check [`supports_proxy_task_api`](Self::supports_proxy_task_api) first,
     /// or use `write_response_header()` / `write_response_body()` for other
     /// session types.
+    #[track_caller]
     pub fn send_downstream_proxy_task(&mut self, task: HttpTask) {
         match self {
             Self::H1(s) => s.send_proxy_task(task),
             Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
             Self::Subrequest(s) => s.send_proxy_task(task),
-            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
+            Self::Custom(s) => s.send_proxy_task(task),
         }
     }
 
@@ -930,7 +962,7 @@ impl Session {
             Self::H1(s) => s.has_pending_proxy_tasks(),
             Self::H2(_) => false, // TODO: implement for H2
             Self::Subrequest(s) => s.has_pending_proxy_tasks(),
-            Self::Custom(_) => false, // TODO: implement for custom
+            Self::Custom(s) => s.has_pending_proxy_tasks(),
         }
     }
 
@@ -947,7 +979,252 @@ impl Session {
             Self::H1(s) => s.write_proxy_tasks().await,
             Self::H2(_) => panic!("H2 proxy task API not yet implemented"),
             Self::Subrequest(s) => s.write_proxy_tasks().await,
-            Self::Custom(_) => panic!("Custom proxy task API not yet implemented"),
+            Self::Custom(s) => s.write_proxy_tasks().await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::http::custom::CustomMessageWrite;
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[tokio::test]
+    async fn custom_proxy_task_defaults_are_opted_out_and_fail_loudly() {
+        let mut session = Session::new_custom(Box::new(()));
+
+        assert!(!session.supports_proxy_task_api());
+        session.set_proxy_tasks_enabled(true);
+        assert!(!session.supports_proxy_task_api());
+        assert!(!session.has_pending_downstream_proxy_tasks());
+
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            session.send_downstream_proxy_task(HttpTask::Done);
+        }))
+        .is_err());
+
+        let join = tokio::spawn(async move { session.write_downstream_proxy_tasks().await });
+        assert!(join.await.unwrap_err().is_panic());
+    }
+
+    #[tokio::test]
+    async fn custom_proxy_task_methods_delegate_to_the_custom_session() {
+        let mut session = Session::new_custom(Box::new(ProxyTaskCustom::new()));
+
+        assert!(!session.supports_proxy_task_api());
+        session.set_proxy_tasks_enabled(true);
+        assert!(session.supports_proxy_task_api());
+
+        session.send_downstream_proxy_task(HttpTask::Done);
+        assert!(session.has_pending_downstream_proxy_tasks());
+        assert!(session.write_downstream_proxy_tasks().await.unwrap());
+        assert!(!session.has_pending_downstream_proxy_tasks());
+    }
+
+    struct ProxyTaskCustom {
+        header: RequestHeader,
+        enabled: bool,
+        tasks: Vec<HttpTask>,
+    }
+
+    impl ProxyTaskCustom {
+        fn new() -> Self {
+            Self {
+                header: RequestHeader::build("GET", b"/", None).unwrap(),
+                enabled: false,
+                tasks: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SessionCustom for ProxyTaskCustom {
+        fn req_header(&self) -> &RequestHeader {
+            &self.header
+        }
+
+        fn req_header_mut(&mut self) -> &mut RequestHeader {
+            &mut self.header
+        }
+
+        async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        async fn drain_request_body(&mut self) -> Result<()> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        async fn write_response_header(
+            &mut self,
+            _resp: Box<ResponseHeader>,
+            _end: bool,
+        ) -> Result<()> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        async fn write_response_header_ref(
+            &mut self,
+            _resp: &ResponseHeader,
+            _end: bool,
+        ) -> Result<()> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        async fn write_body(&mut self, _data: Bytes, _end: bool) -> Result<()> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        async fn write_trailers(&mut self, _trailers: HeaderMap) -> Result<()> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        async fn response_duplex_vec(&mut self, _tasks: Vec<HttpTask>) -> Result<bool> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn proxy_tasks_enabled(&self) -> bool {
+            self.enabled
+        }
+
+        fn set_proxy_tasks_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
+
+        fn send_proxy_task(&mut self, task: HttpTask) {
+            self.tasks.push(task);
+        }
+
+        fn has_pending_proxy_tasks(&self) -> bool {
+            !self.tasks.is_empty()
+        }
+
+        async fn write_proxy_tasks(&mut self) -> Result<bool> {
+            self.tasks.clear();
+            Ok(true)
+        }
+
+        fn set_read_timeout(&mut self, _timeout: Option<Duration>) {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn get_read_timeout(&self) -> Option<Duration> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn set_write_timeout(&mut self, _timeout: Option<Duration>) {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn get_write_timeout(&self) -> Option<Duration> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn set_total_drain_timeout(&mut self, _timeout: Option<Duration>) {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn get_total_drain_timeout(&self) -> Option<Duration> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn request_summary(&self) -> String {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn response_written(&self) -> Option<&ResponseHeader> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        async fn shutdown(&mut self, _code: u32, _ctx: &str) {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn is_body_done(&mut self) -> bool {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        async fn finish(&mut self) -> Result<()> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn is_body_empty(&mut self) -> bool {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        async fn read_body_or_idle(&mut self, _no_body_expected: bool) -> Result<Option<Bytes>> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn body_bytes_sent(&self) -> usize {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn body_bytes_read(&self) -> usize {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn digest(&self) -> Option<&Digest> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn digest_mut(&mut self) -> Option<&mut Digest> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn client_addr(&self) -> Option<&SocketAddr> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn server_addr(&self) -> Option<&SocketAddr> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn pseudo_raw_h1_request_header(&self) -> Bytes {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn enable_retry_buffering(&mut self) {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn retry_buffer_truncated(&self) -> bool {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn get_retry_buffer(&self) -> Option<Bytes> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        async fn finish_custom(&mut self) -> Result<()> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn take_custom_message_reader(
+            &mut self,
+        ) -> Option<Box<dyn Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn restore_custom_message_reader(
+            &mut self,
+            _reader: Box<dyn Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
+        ) -> Result<()> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn take_custom_message_writer(&mut self) -> Option<Box<dyn CustomMessageWrite>> {
+            unreachable!("not used by proxy task dispatch test")
+        }
+
+        fn restore_custom_message_writer(
+            &mut self,
+            _writer: Box<dyn CustomMessageWrite>,
+        ) -> Result<()> {
+            unreachable!("not used by proxy task dispatch test")
         }
     }
 }
