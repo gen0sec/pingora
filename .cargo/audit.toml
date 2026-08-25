@@ -9,4 +9,12 @@ ignore = [
     "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints incorrectly accepted
     "RUSTSEC-2026-0099", # rustls-webpki: name constraints accepted for wildcard certs
     "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing
+
+    # h2 0.3.27 reaches us down that same dial9 worker-s3 path, via
+    # aws-smithy-http-client, which still builds on hyper 0.14. The latest
+    # published aws-smithy-http-client (1.4.0) has no hyper 1.x release, so
+    # no version bump clears this. Only reachable as an HTTP/2 *client*
+    # talking to S3; pingora's own serving path uses h2 0.4.19 and is not
+    # affected. Remove once aws-smithy-http-client ships on hyper 1.x.
+    "RUSTSEC-2026-0258", # h2: unbounded empty DATA frames
 ]
