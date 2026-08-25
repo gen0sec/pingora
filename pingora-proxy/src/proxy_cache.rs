@@ -25,6 +25,8 @@ use pingora_core::ErrorType;
 use range_filter::RangeBodyFilter;
 use std::time::SystemTime;
 
+const DEFAULT_MAX_CACHE_LOCK_RETRIES: usize = 2;
+
 impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
@@ -81,8 +83,8 @@ where
         }
 
         // cache lookup logic
+        let mut cache_lock_retries = 0;
         loop {
-            // for cache lock, TODO: cap the max number of loops
             match session.cache.cache_lookup().await {
                 Ok(res) => {
                     let mut hit_status_opt = None;
@@ -118,7 +120,8 @@ where
 
                         // hit
                         // TODO: maybe round and/or cache now()
-                        let is_fresh = meta.is_fresh(SystemTime::now());
+                        let now = SystemTime::now();
+                        let is_fresh = meta.is_fresh(now);
                         // check if we should force expire or force miss
                         let hit_status = match self
                             .inner
@@ -147,7 +150,7 @@ where
                                 HitStatus::ForceExpired
                             }
                             Ok(Some(ForcedFreshness::ForceMiss)) => HitStatus::ForceMiss,
-                            Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::Fresh,
+                            Ok(Some(ForcedFreshness::ForceFresh)) => HitStatus::ForceFresh,
                         };
 
                         hit_status_opt = Some(hit_status);
@@ -158,10 +161,20 @@ where
 
                     if hit_status_opt.is_none_or(HitStatus::is_treated_as_miss) {
                         // cache miss
-                        if session.cache.is_cache_locked() {
+                        if !session.cache.enabled() {
+                            // An admission policy may have disabled caching during cache_lookup().
+                            break None;
+                        } else if session.cache.is_cache_locked() {
                             // Another request is filling the cache; try waiting til that's done and retry.
                             let lock_status = session.cache.cache_lock_wait().await;
                             if self.handle_lock_status(session, ctx, lock_status) {
+                                if self.cache_lock_retry_limit_exceeded(
+                                    session,
+                                    ctx,
+                                    &mut cache_lock_retries,
+                                ) {
+                                    break None;
+                                }
                                 continue;
                             } else {
                                 break None;
@@ -196,6 +209,13 @@ where
                             if !will_serve_stale {
                                 let lock_status = session.cache.cache_lock_wait().await;
                                 if self.handle_lock_status(session, ctx, lock_status) {
+                                    if self.cache_lock_retry_limit_exceeded(
+                                        session,
+                                        ctx,
+                                        &mut cache_lock_retries,
+                                    ) {
+                                        break None;
+                                    }
                                     continue;
                                 } else {
                                     break None;
@@ -367,7 +387,7 @@ where
             if !range_filter.is_multipart_range() || !hit_handler.can_seek_multipart() {
                 return Ok(false);
             }
-            let r = range_filter.next_cache_multipart_range();
+            let r = range_filter.next_cache_multipart_range()?;
             hit_handler.seek_multipart(r.start, Some(r.end))?;
             // we still need RangeBodyFilter's help to transform the byte
             // range into a multipart response.
@@ -541,6 +561,19 @@ where
 
     // TODO: cache upstream header filter to add/remove headers
 
+    async fn finish_miss_handler_best_effort(&self, session: &mut Session, ctx: &SV::CTX)
+    where
+        SV: ProxyHttp,
+    {
+        if let Err(e) = session.cache.finish_miss_handler().await {
+            warn!(
+                "Failed to finish cache miss admission: {e}, {}",
+                self.inner.request_summary(session, ctx)
+            );
+            session.cache.disable(NoCacheReason::StorageError);
+        }
+    }
+
     pub(crate) async fn cache_http_task(
         &self,
         session: &mut Session,
@@ -649,7 +682,7 @@ where
                                     .unwrap() // safe, it is set above
                                     .write_body(Bytes::new(), true)
                                     .await?;
-                                session.cache.finish_miss_handler().await?;
+                                self.finish_miss_handler_best_effort(session, ctx).await;
                             }
                         }
                     }
@@ -695,13 +728,13 @@ where
 
                             miss_handler.write_body(d.clone(), *end_stream).await?;
                             if *end_stream {
-                                session.cache.finish_miss_handler().await?;
+                                self.finish_miss_handler_best_effort(session, ctx).await;
                             }
                         }
                     }
                     None => {
                         if session.cache.enabled() && *end_stream {
-                            session.cache.finish_miss_handler().await?;
+                            self.finish_miss_handler_best_effort(session, ctx).await;
                         }
                     }
                 }
@@ -709,7 +742,7 @@ where
             HttpTask::Trailer(_) => {} // h1 trailer is not supported yet
             HttpTask::Done => {
                 if session.cache.enabled() {
-                    session.cache.finish_miss_handler().await?;
+                    self.finish_miss_handler_best_effort(session, ctx).await;
                 }
             }
             HttpTask::Failed(_) => {
@@ -949,6 +982,32 @@ where
             // software bug, this status should be impossible to reach
             LockStatus::Waiting => panic!("impossible LockStatus::Waiting"),
         }
+    }
+
+    fn cache_lock_retry_limit_exceeded(
+        &self,
+        session: &mut Session,
+        ctx: &SV::CTX,
+        cache_lock_retries: &mut usize,
+    ) -> bool
+    where
+        SV: ProxyHttp,
+    {
+        *cache_lock_retries += 1;
+        let max_retries = session
+            .cache
+            .cache_lock_max_retries()
+            .unwrap_or(DEFAULT_MAX_CACHE_LOCK_RETRIES);
+        if *cache_lock_retries <= max_retries {
+            return false;
+        }
+
+        warn!(
+            "Cache lock retry limit exceeded, {}",
+            self.inner.request_summary(session, ctx)
+        );
+        session.cache.disable(NoCacheReason::CacheLockRetryLimit);
+        true
     }
 }
 
@@ -1525,7 +1584,7 @@ pub mod range_filter {
 
         // no range, try HEAD
         let mut req = gen_req();
-        req.method = Method::HEAD;
+        req.set_method(Method::HEAD);
         let mut resp = gen_resp();
         assert_eq!(RangeType::None, range_header_filter(&req, &mut resp, None));
         assert_eq!(resp.status.as_u16(), 200);
@@ -1818,23 +1877,43 @@ pub mod range_filter {
         }
 
         /// Returns the next multipart range to seek for the cache body reader.
-        pub fn next_cache_multipart_range(&mut self) -> Range<usize> {
-            match &self.range {
-                RangeType::Multi(multipart_info) => {
-                    match self.cache_multipart_idx.as_mut() {
-                        Some(v) => *v += 1,
-                        None => self.cache_multipart_idx = Some(0),
-                    }
-                    let cache_multipart_idx = self.cache_multipart_idx.expect("set above");
-                    let multipart_idx = self.multipart_idx.expect("must be set on multirange");
-                    // NOTE: currently this assumes once we start seeking multipart from the hit
-                    // handler, it will continue to return can_seek_multipart true.
-                    assert_eq!(multipart_idx, cache_multipart_idx,
-                        "cache multipart idx should match multipart idx, or there is a hit handler bug");
-                    multipart_info.ranges[cache_multipart_idx].clone()
-                }
-                _ => panic!("tried to advance multipart idx on non-multipart range"),
+        ///
+        /// The body filter and seekable cache reader must advance through each
+        /// part together. If they diverge, the response body cannot be served
+        /// correctly; report an internal error rather than panic.
+        pub fn next_cache_multipart_range(&mut self) -> Result<Range<usize>> {
+            let RangeType::Multi(multipart_info) = &self.range else {
+                return Error::e_explain(
+                    InternalError,
+                    "tried to advance cache multipart range on a non-multipart response",
+                );
+            };
+
+            let cache_multipart_idx = self.cache_multipart_idx.map_or(0, |idx| idx + 1);
+            let Some(multipart_idx) = self.multipart_idx else {
+                return Error::e_explain(
+                    InternalError,
+                    "multipart response is missing body filter progress state",
+                );
+            };
+            if multipart_idx != cache_multipart_idx {
+                return Error::e_explain(
+                    InternalError,
+                    format!(
+                        "cache multipart progress mismatch: body_filter_idx={multipart_idx}, cache_reader_idx={cache_multipart_idx}, ranges={}",
+                        multipart_info.ranges.len(),
+                    ),
+                );
             }
+
+            let Some(range) = multipart_info.ranges.get(cache_multipart_idx).cloned() else {
+                return Error::e_explain(
+                    InternalError,
+                    "cache multipart reader advanced past the final requested range",
+                );
+            };
+            self.cache_multipart_idx = Some(cache_multipart_idx);
+            Ok(range)
         }
 
         pub fn set_current_cursor(&mut self, current: usize) {
@@ -2208,6 +2287,51 @@ pub mod range_filter {
             "Missing final boundary"
         );
     }
+
+    #[test]
+    fn test_cache_multipart_advance_errors_when_reader_ends_part_early() {
+        let ranges = vec![0..10, 20..30];
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_multi(ranges));
+
+        let first = body_filter.next_cache_multipart_range().unwrap();
+        assert_eq!(first, 0..10);
+        body_filter.set_current_cursor(first.start);
+
+        // The cache reader yielded only a prefix of the selected part before
+        // reporting EOF. The filter therefore has not advanced past part 0.
+        assert!(body_filter
+            .filter_body(Some(Bytes::from_static(b"01234")))
+            .is_some());
+
+        let err = body_filter.next_cache_multipart_range().unwrap_err();
+        assert_eq!(err.etype(), &InternalError);
+        assert!(err
+            .to_string()
+            .contains("cache multipart progress mismatch: body_filter_idx=0, cache_reader_idx=1"));
+    }
+
+    #[test]
+    fn test_cache_multipart_advance_errors_when_reader_overreads_part() {
+        let ranges = vec![0..2, 4..6, 8..10];
+        let mut body_filter = RangeBodyFilter::new_range(RangeType::new_multi(ranges));
+
+        let first = body_filter.next_cache_multipart_range().unwrap();
+        assert_eq!(first, 0..2);
+        body_filter.set_current_cursor(first.start);
+
+        // A seekable reader is expected to stop at the selected part's end.
+        // This chunk spans all requested parts and advances the filter beyond
+        // what the reader's seek state records.
+        assert!(body_filter
+            .filter_body(Some(Bytes::from_static(b"0123456789")))
+            .is_some());
+
+        let err = body_filter.next_cache_multipart_range().unwrap_err();
+        assert_eq!(err.etype(), &InternalError);
+        assert!(err
+            .to_string()
+            .contains("cache multipart progress mismatch: body_filter_idx=3, cache_reader_idx=1"));
+    }
 }
 
 // a state machine for proxy logic to tell when to use cache in the case of
@@ -2400,19 +2524,17 @@ impl ServeFromCache {
                     range_filter.range = RangeType::None;
                 }
             }
-            RangeType::Multi(_info) => {
-                // safety: called only if the async_body_reader exists
-                if cache.miss_body_reader().unwrap().can_seek_multipart() {
-                    let range = range_filter.next_cache_multipart_range();
-                    cache
-                        .miss_body_reader()
-                        .unwrap()
-                        .seek_multipart(range.start, Some(range.end))
-                        .or_err(InternalError, "cannot seek hit handler for multirange")?;
-                    // we still need RangeBodyFilter's help to transform the byte
-                    // range into a multipart response.
-                    range_filter.set_current_cursor(range.start);
-                }
+            // safety: called only if the async_body_reader exists
+            RangeType::Multi(_info) if cache.miss_body_reader().unwrap().can_seek_multipart() => {
+                let range = range_filter.next_cache_multipart_range()?;
+                cache
+                    .miss_body_reader()
+                    .unwrap()
+                    .seek_multipart(range.start, Some(range.end))
+                    .or_err(InternalError, "cannot seek hit handler for multirange")?;
+                // we still need RangeBodyFilter's help to transform the byte
+                // range into a multipart response.
+                range_filter.set_current_cursor(range.start);
             }
             _ => {}
         }
@@ -2438,17 +2560,15 @@ impl ServeFromCache {
                     range_filter.range = RangeType::None;
                 }
             }
-            RangeType::Multi(_info) => {
-                if cache.hit_handler().can_seek_multipart() {
-                    let range = range_filter.next_cache_multipart_range();
-                    cache
-                        .hit_handler()
-                        .seek_multipart(range.start, Some(range.end))
-                        .or_err(InternalError, "cannot seek hit handler for multirange")?;
-                    // we still need RangeBodyFilter's help to transform the byte
-                    // range into a multipart response.
-                    range_filter.set_current_cursor(range.start);
-                }
+            RangeType::Multi(_info) if cache.hit_handler().can_seek_multipart() => {
+                let range = range_filter.next_cache_multipart_range()?;
+                cache
+                    .hit_handler()
+                    .seek_multipart(range.start, Some(range.end))
+                    .or_err(InternalError, "cannot seek hit handler for multirange")?;
+                // we still need RangeBodyFilter's help to transform the byte
+                // range into a multipart response.
+                range_filter.set_current_cursor(range.start);
             }
             _ => {}
         }

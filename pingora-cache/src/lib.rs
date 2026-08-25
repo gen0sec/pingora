@@ -28,6 +28,7 @@ use storage::MissFinishType;
 use strum::IntoStaticStr;
 use trace::{CacheTraceCTX, Span, Tag};
 
+pub mod admission;
 pub mod cache_control;
 pub mod eviction;
 pub mod filters;
@@ -44,6 +45,7 @@ pub mod trace;
 mod variance;
 
 use crate::max_file_size::MaxFileSizeTracker;
+use admission::{AdmissionPolicy, Decision};
 pub use key::CacheKey;
 use lock::{CacheKeyLockImpl, LockStatus, Locked};
 pub use memory::MemCache;
@@ -129,11 +131,10 @@ pub enum NoCacheReason {
     StorageError,
     /// Due to other types of internal issues
     InternalError,
-    /// will be cacheable but skip cache admission now
+    /// The response may be cacheable, but this request should not fill the cache.
     ///
-    /// This happens when the cache predictor predicted that this request is not cacheable, but
-    /// the response turns out to be OK to cache. However, it might be too large to re-enable caching
-    /// for this request
+    /// This can happen when an admission policy defers an absent key, or when the cache predictor
+    /// bypassed lookup and the response cannot safely be admitted by the current request.
     Deferred,
     /// Due to the proxy upstream filter declining the current request from going upstream
     DeclinedToUpstream,
@@ -144,6 +145,9 @@ pub enum NoCacheReason {
     /// This request waited too long for the writer of the cache lock to finish, so this request will
     /// fetch from the origin without caching
     CacheLockTimeout,
+    /// This request retried cache lookup too many times after waiting behind cache locks, so this
+    /// request will fetch from the origin without caching.
+    CacheLockRetryLimit,
     /// Other custom defined reasons
     Custom(&'static str),
 }
@@ -164,6 +168,7 @@ impl NoCacheReason {
             UpstreamError => "UpstreamError",
             CacheLockGiveUp => "CacheLockGiveUp",
             CacheLockTimeout => "CacheLockTimeout",
+            CacheLockRetryLimit => "CacheLockRetryLimit",
             Custom(s) => s,
         }
     }
@@ -175,6 +180,8 @@ pub struct HttpCacheDigest {
     pub lock_duration: Option<Duration>,
     // time spent in cache lookup and reading the header
     pub lookup_duration: Option<Duration>,
+    /// Admission decision made for an absent key, if an admission policy was configured.
+    pub admission: Option<Decision>,
 }
 
 /// Convenience function to add a duration to an optional duration
@@ -286,6 +293,7 @@ pub struct LockCtx {
     pub lock: Option<Locked>,
     pub cache_lock: &'static CacheKeyLockImpl,
     pub wait_timeout: Option<Duration>,
+    pub max_retries: Option<usize>,
 }
 
 // Fields like storage handlers that are needed only when cache is enabled (or bypassing).
@@ -293,10 +301,14 @@ struct HttpCacheInnerEnabled {
     pub meta: Option<CacheMeta>,
     // when set, even if an asset exists, it would only be considered valid after this timestamp
     pub valid_after: Option<SystemTime>,
+    // Variance from the stale metadata before set_cache_meta() replaces it.
+    // update_variance() uses this to detect Vary family changes and reset provenance.
+    stale_meta_variance: Option<HashBinary>,
     pub miss_handler: Option<MissHandler>,
     pub body_reader: Option<HitHandler>,
     pub storage: &'static (dyn storage::Storage + Sync), // static for now
     pub eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
+    pub admission: Option<&'static dyn AdmissionPolicy>,
     pub lock_ctx: Option<LockCtx>,
     pub traces: trace::CacheTraceCTX,
 }
@@ -315,7 +327,10 @@ struct HttpCacheInner {
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct CacheOptionOverrides {
+    /// How long a cache lock reader should wait before giving up.
     pub wait_timeout: Option<Duration>,
+    /// How many times a cache lock reader should retry lookup after waiting on a lock.
+    pub max_lock_retries: Option<usize>,
 }
 
 impl HttpCache {
@@ -400,7 +415,7 @@ impl HttpCache {
                         Custom(reason) => lock_ctx.cache_lock.custom_lock_status(reason),
                         // should never happen, NeverEnabled shouldn't hold a lock
                         NeverEnabled => panic!("NeverEnabled holds a write lock"),
-                        CacheLockGiveUp | CacheLockTimeout => {
+                        CacheLockGiveUp | CacheLockTimeout | CacheLockRetryLimit => {
                             panic!("CacheLock* are for cache lock readers only")
                         }
                     };
@@ -494,22 +509,29 @@ impl HttpCache {
             CachePhase::Disabled(_) => {
                 self.phase = CachePhase::Uninit;
 
+                let wait_timeout = option_overrides
+                    .as_ref()
+                    .and_then(|overrides| overrides.wait_timeout);
+                let max_retries = option_overrides
+                    .as_ref()
+                    .and_then(|overrides| overrides.max_lock_retries);
                 let lock_ctx = cache_lock.map(|cache_lock| LockCtx {
                     cache_lock,
                     lock: None,
-                    wait_timeout: option_overrides
-                        .as_ref()
-                        .and_then(|overrides| overrides.wait_timeout),
+                    wait_timeout,
+                    max_retries,
                 });
 
                 self.inner = Some(Box::new(HttpCacheInner {
                     enabled_ctx: Some(Box::new(HttpCacheInnerEnabled {
                         meta: None,
                         valid_after: None,
+                        stale_meta_variance: None,
                         miss_handler: None,
                         body_reader: None,
                         storage,
                         eviction,
+                        admission: None,
                         lock_ctx,
                         traces: CacheTraceCTX::new(),
                     })),
@@ -544,15 +566,39 @@ impl HttpCache {
                 {
                     panic!("lock already set when resetting cache lock")
                 } else {
+                    let wait_timeout = option_overrides
+                        .as_ref()
+                        .and_then(|overrides| overrides.wait_timeout);
+                    let max_retries = option_overrides
+                        .as_ref()
+                        .and_then(|overrides| overrides.max_lock_retries);
                     let lock_ctx = cache_lock.map(|cache_lock| LockCtx {
                         cache_lock,
                         lock: None,
-                        wait_timeout: option_overrides.and_then(|overrides| overrides.wait_timeout),
+                        wait_timeout,
+                        max_retries,
                     });
                     inner_enabled.lock_ctx = lock_ctx;
                 }
             }
             _ => panic!("wrong phase: {:?}", self.phase),
+        }
+    }
+
+    /// Set the [`AdmissionPolicy`] used to decide whether an absent key may fill the cache.
+    ///
+    /// The policy is only consulted when storage reports a raw miss. Entries rejected
+    /// by `valid_after` filtering still follow the normal miss path.
+    ///
+    /// # Panics
+    ///
+    /// Panics after a cache lookup or fill has started.
+    pub fn set_admission_policy(&mut self, policy: &'static dyn AdmissionPolicy) {
+        match self.phase {
+            CachePhase::Uninit | CachePhase::CacheKey => {
+                self.inner_enabled_mut().admission = Some(policy);
+            }
+            _ => panic!("wrong phase to set admission policy: {:?}", self.phase),
         }
     }
 
@@ -781,8 +827,10 @@ impl HttpCache {
                 // here after not being able to acquire the cache lock, and our item has since
                 // purged or expired. We should be sure that the meta is not set in this case
                 // as there shouldn't be a meta set for cache misses.
-                self.inner_enabled_mut().meta = None;
-                self.inner_enabled_mut().traces.start_miss_span();
+                let inner_enabled = self.inner_enabled_mut();
+                inner_enabled.meta = None;
+                inner_enabled.stale_meta_variance = None;
+                inner_enabled.traces.start_miss_span();
             }
             _ => panic!("wrong phase {:?}", self.phase),
         }
@@ -960,7 +1008,7 @@ impl HttpCache {
                     return Ok(());
                 }
                 let miss_handler = inner_enabled.miss_handler.take().unwrap();
-                let size = miss_handler.finish().await?;
+                let finish_result = miss_handler.finish().await;
                 let key = inner
                     .key
                     .as_ref()
@@ -970,9 +1018,21 @@ impl HttpCache {
                     if let Some(Locked::Write(permit)) = lock {
                         // no need to call r.unlock() because release() will call it
                         // r is a guard to make sure the lock is unlocked when this request is dropped
-                        lock_ctx.cache_lock.release(key, permit, LockStatus::Done);
+                        let lock_status = if finish_result.is_ok() {
+                            LockStatus::Done
+                        } else {
+                            LockStatus::TransientError
+                        };
+                        lock_ctx.cache_lock.release(key, permit, lock_status);
                     }
                 }
+                let size = match finish_result {
+                    Ok(size) => size,
+                    Err(e) => {
+                        inner_enabled.traces.finish_miss_span();
+                        return Err(e);
+                    }
+                };
                 if let Some(eviction) = inner_enabled.eviction {
                     let cache_key = key.to_compact();
                     let meta = inner_enabled.meta.as_ref().unwrap();
@@ -1005,11 +1065,29 @@ impl HttpCache {
     }
 
     /// Set the [CacheMeta] of the cache
-    pub fn set_cache_meta(&mut self, meta: CacheMeta) {
+    ///
+    /// # Panics
+    ///
+    /// Panics unless called in [CachePhase::Miss] or [CachePhase::Stale]. In stale phase, the
+    /// stale metadata must still be present.
+    pub fn set_cache_meta(&mut self, mut meta: CacheMeta) {
         match self.phase {
             // TODO: store the staled meta somewhere else for future use?
-            CachePhase::Stale | CachePhase::Miss => {
+            CachePhase::Stale => {
                 let inner_enabled = self.inner_enabled_mut();
+                let old_meta = inner_enabled
+                    .meta
+                    .as_ref()
+                    .expect("stale phase has cache meta");
+                inner_enabled.stale_meta_variance = old_meta.variance();
+                meta.set_provenance(old_meta.provenance());
+                // TODO: have a separate expired span?
+                inner_enabled.traces.log_meta_in_miss_span(&meta);
+                inner_enabled.meta = Some(meta);
+            }
+            CachePhase::Miss => {
+                let inner_enabled = self.inner_enabled_mut();
+                inner_enabled.stale_meta_variance = None;
                 // TODO: have a separate expired span?
                 inner_enabled.traces.log_meta_in_miss_span(&meta);
                 inner_enabled.meta = Some(meta);
@@ -1039,13 +1117,16 @@ impl HttpCache {
                 // update new meta with old meta's created time
                 let old_meta = inner_enabled.meta.take().unwrap();
                 let created = old_meta.0.internal.created;
+                let provenance = old_meta.provenance();
                 meta.0.internal.created = created;
+                meta.set_provenance(provenance);
                 // meta.internal.updated was already set to new meta's `created`,
                 // no need to set `updated` here
                 // Merge old extensions with new ones. New exts take precedence if they conflict.
                 let mut extensions = old_meta.0.extensions;
                 extensions.extend(meta.0.extensions);
                 meta.0.extensions = extensions;
+                inner_enabled.stale_meta_variance = None;
 
                 inner_enabled.meta.replace(meta);
 
@@ -1162,16 +1243,23 @@ impl HttpCache {
         //
         // **Case 1**: Variance was absent, but caller sets it now.
         // We will just insert it into the meta. The current asset becomes the primary variant.
-        // Because the current location of the asset is already the primary variant, nothing else
-        // needs to be done.
+        // Because the current location of the asset is already the primary variant, the lookup key
+        // does not need to change. If this is an expired response, this is a new Vary family, so
+        // provenance is reset to the refreshed metadata's created timestamp.
         //
         // **Case 2**: Variance was present, but it changed or was removed.
         // We want the current asset to take over the primary slot, in order to invalidate all
-        // other variants derived under the old Vary.
+        // other variants derived under the old Vary. For expired responses, provenance is reset
+        // to the refreshed metadata's created timestamp.
         //
         // **Case 3**: Variance did not change.
         // Nothing needs to happen.
-        let inner = match self.phase {
+        //
+        // These provenance updates do not provide ordering on their own. Writers need a cache lock
+        // to avoid racing each other. A purge can still race with a stale refresh: whichever observes
+        // or writes storage last determines whether old provenance is carried forward or replaced.
+        let phase = self.phase;
+        let inner = match phase {
             CachePhase::Miss | CachePhase::Expired => self.inner_mut(),
             _ => panic!("wrong phase {:?}", self.phase),
         };
@@ -1179,6 +1267,21 @@ impl HttpCache {
             .enabled_ctx
             .as_mut()
             .expect("cache enabled on miss and expired");
+        let old_key_variance = inner.key.as_ref().unwrap().get_variance_key().copied();
+        let stale_meta_variance = if phase == CachePhase::Expired {
+            inner_enabled.stale_meta_variance.take()
+        } else {
+            inner_enabled.stale_meta_variance = None;
+            None
+        };
+        let reset_provenance_to_created = if phase == CachePhase::Expired {
+            match old_key_variance {
+                Some(old_variance) => Some(old_variance) != variance,
+                None => stale_meta_variance != variance,
+            }
+        } else {
+            false
+        };
 
         // Update the variance in the meta
         if let Some(variance_hash) = variance.as_ref() {
@@ -1190,13 +1293,20 @@ impl HttpCache {
         } else {
             inner_enabled.meta.as_mut().unwrap().remove_variance();
         }
+        if reset_provenance_to_created {
+            inner_enabled
+                .meta
+                .as_mut()
+                .unwrap()
+                .reset_provenance_to_created();
+        }
 
         // Change the lookup `key` if necessary, in order to admit asset into the primary slot
         // instead of the secondary slot.
         let key = inner.key.as_ref().unwrap();
-        if let Some(old_variance) = key.get_variance_key().as_ref() {
+        if let Some(old_variance) = old_key_variance {
             // This is a secondary variant slot.
-            if Some(*old_variance) != variance.as_ref() {
+            if Some(old_variance) != variance {
                 // This new variance does not match the variance in the cache key we used to look
                 // up this asset.
                 // Drop the cache lock to avoid leaving a dangling lock
@@ -1246,9 +1356,11 @@ impl HttpCache {
     /// Return the [CacheMeta] of this asset if any
     ///
     /// Different from [Self::cache_meta()], this function is allowed to be called in
-    /// [CachePhase::Miss] phase where the cache meta maybe set.
-    /// # Panic
-    /// Panic in phases that shouldn't have cache meta.
+    /// any phase and will not panic due to a wrong phase. It returns the cache meta in
+    /// the phases where one may be set ([CachePhase::Miss], [CachePhase::Stale],
+    /// [CachePhase::StaleUpdating], [CachePhase::Expired], [CachePhase::Hit],
+    /// [CachePhase::Revalidated], and [CachePhase::RevalidatedNoCache]); in all other
+    /// phases it returns `None` because no cache meta can exist.
     pub fn maybe_cache_meta(&self) -> Option<&CacheMeta> {
         match self.phase {
             CachePhase::Miss
@@ -1258,7 +1370,7 @@ impl HttpCache {
             | CachePhase::Hit
             | CachePhase::Revalidated
             | CachePhase::RevalidatedNoCache(_) => self.inner_enabled().meta.as_ref(),
-            _ => panic!("wrong phase {:?}", self.phase),
+            _ => None,
         }
     }
 
@@ -1278,42 +1390,83 @@ impl HttpCache {
     ///
     /// A cache hit will return [CacheMeta] which contains the header and meta info about
     /// the cache as well as a [HitHandler] to read the cache hit body.
+    ///
+    /// When an admission policy defers a raw storage miss, this returns `Ok(None)` and disables
+    /// caching with [`NoCacheReason::Deferred`]. Callers must check [`Self::enabled()`] before
+    /// calling [`Self::cache_miss()`].
+    ///
+    /// Admission is observed at most once per [`HttpCache`], on an initial
+    /// [`CachePhase::CacheKey`] raw storage miss. Retried lookups and stale refills reuse the
+    /// existing admission outcome or proceed without another observation.
+    ///
+    /// Entries rejected by `valid_after` filtering are not raw storage misses and bypass
+    /// admission. After an invalidation, admission therefore does not provide additional
+    /// suppression for concurrent fills beyond the configured cache-lock behavior.
+    ///
     /// # Panic
     /// Panic in other phases.
     pub async fn cache_lookup(&mut self) -> Result<Option<(CacheMeta, HitHandler)>> {
         match self.phase {
             // Stale is allowed here because stale-> cache_lock -> lookup again
             CachePhase::CacheKey | CachePhase::Stale => {
-                let inner = self
-                    .inner
-                    .as_mut()
-                    .expect("Cache phase is checked and should have inner");
-                let inner_enabled = inner
-                    .enabled_ctx
-                    .as_mut()
-                    .expect("Cache enabled on cache_lookup");
-                #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
-                let mut span = inner_enabled.traces.child("lookup");
-                let key = inner.key.as_ref().unwrap(); // safe, this phase should have cache key
-                let now = Instant::now();
-                let result = inner_enabled.storage.lookup(key, &span.handle()).await?;
-                // one request may have multiple lookups
-                self.digest.add_lookup_duration(now.elapsed());
-                let result = result.and_then(|(meta, header)| {
-                    if let Some(ts) = inner_enabled.valid_after {
-                        if meta.created() < ts {
-                            span.set_tag(|| trace::Tag::new("not valid", true));
-                            return None;
+                let observe_admission =
+                    self.phase == CachePhase::CacheKey && self.digest.admission.is_none();
+                let (result, admission) = {
+                    let inner = self
+                        .inner
+                        .as_mut()
+                        .expect("Cache phase is checked and should have inner");
+                    let inner_enabled = inner
+                        .enabled_ctx
+                        .as_mut()
+                        .expect("Cache enabled on cache_lookup");
+                    #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
+                    let mut span = inner_enabled.traces.child("lookup");
+                    let key = inner.key.as_ref().unwrap(); // safe, this phase should have cache key
+                    let now = Instant::now();
+                    let result = inner_enabled.storage.lookup(key, &span.handle()).await?;
+                    // one request may have multiple lookups
+                    self.digest.add_lookup_duration(now.elapsed());
+                    let storage_miss = result.is_none();
+                    let result = result.and_then(|(meta, header)| {
+                        if let Some(ts) = inner_enabled.valid_after {
+                            // `created` (not `provenance`) is the right field to compare on
+                            // the variant side: we are asking "was this specific variant
+                            // admitted before the primary's tombstone?" -- a fact about the
+                            // variant entry itself.
+                            if meta.created() < ts {
+                                span.set_tag(|| trace::Tag::new("not valid", true));
+                                return None;
+                            }
+                        }
+                        Some((meta, header))
+                    });
+                    let admission = (storage_miss && observe_admission)
+                        .then(|| inner_enabled.admission.map(|policy| policy.observe(key)))
+                        .flatten();
+                    if let Some(decision) = admission {
+                        span.set_tag(|| {
+                            trace::Tag::new("admission.observed", decision.observed() as i64)
+                        });
+                        span.set_tag(|| {
+                            trace::Tag::new("admission.deferred", decision.is_deferred())
+                        });
+                    }
+                    if result.is_none() && admission.is_none_or(|decision| !decision.is_deferred())
+                    {
+                        if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
+                            lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key, false));
                         }
                     }
-                    Some((meta, header))
-                });
-                if result.is_none() {
-                    if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
-                        lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key, false));
+                    span.set_tag(|| trace::Tag::new("found", result.is_some()));
+                    (result, admission)
+                };
+                if let Some(decision) = admission {
+                    self.digest.admission = Some(decision);
+                    if decision.is_deferred() {
+                        self.disable(NoCacheReason::Deferred);
                     }
                 }
-                span.set_tag(|| trace::Tag::new("found", result.is_some()));
                 Ok(result)
             }
             _ => panic!("wrong phase {:?}", self.phase),
@@ -1334,12 +1487,12 @@ impl HttpCache {
                 let inner = self.inner_mut();
                 // make sure that all variances found are fresher than this asset
                 // this is because when purging all the variance, only the primary slot is deleted
-                // the created TS of the primary is the tombstone of all the variances
+                // the provenance timestamp of the primary is the tombstone of all the variances
                 inner
                     .enabled_ctx
                     .as_mut()
                     .expect("cache enabled")
-                    .valid_after = Some(meta.created());
+                    .valid_after = Some(meta.provenance());
 
                 // update vary
                 let key = inner.key.as_mut().unwrap();
@@ -1390,6 +1543,14 @@ impl HttpCache {
                 .and_then(|l| l.lock.as_ref()),
             Some(Locked::Write(_))
         )
+    }
+
+    /// Maximum number of cache lock retries configured for this request.
+    pub fn cache_lock_max_retries(&self) -> Option<usize> {
+        self.inner_enabled()
+            .lock_ctx
+            .as_ref()
+            .and_then(|l| l.max_retries)
     }
 
     /// Take the write lock from this request to transfer it to another one.
@@ -1495,6 +1656,11 @@ impl HttpCache {
         self.digest.lookup_duration
     }
 
+    /// Return the [`Decision`] made for an absent cache key.
+    pub fn admission_decision(&self) -> Option<Decision> {
+        self.digest.admission
+    }
+
     /// Delete the asset from the cache storage
     /// # Panic
     /// Need to be called after the cache key is set. Panic otherwise.
@@ -1592,5 +1758,469 @@ impl HttpCache {
             .traces
             .cache_span
             .set_tag(|| Tag::new("is_subrequest", true))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use http::StatusCode;
+    use std::any::Any;
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{LazyLock, Mutex};
+
+    struct UpdateOkStorage;
+    struct OneShotLookupStorage {
+        entries: Mutex<Vec<(CompactCacheKey, CacheMeta)>>,
+    }
+    struct EmptyHitHandler;
+    struct CountingDeferPolicy(AtomicUsize);
+    struct CountingReadyPolicy(AtomicUsize);
+
+    static UPDATE_OK_STORAGE: UpdateOkStorage = UpdateOkStorage;
+    // Only one test uses this storage. Keep it that way unless the tests also isolate their keys
+    // and clear any entries they push.
+    static ONE_SHOT_LOOKUP_STORAGE: OneShotLookupStorage = OneShotLookupStorage {
+        entries: Mutex::new(Vec::new()),
+    };
+    static RAW_MISS_DEFER_POLICY: CountingDeferPolicy = CountingDeferPolicy(AtomicUsize::new(0));
+    static VALID_AFTER_DEFER_POLICY: CountingDeferPolicy = CountingDeferPolicy(AtomicUsize::new(0));
+    static STALE_DEFER_POLICY: CountingDeferPolicy = CountingDeferPolicy(AtomicUsize::new(0));
+    static RAW_MISS_READY_POLICY: CountingReadyPolicy = CountingReadyPolicy(AtomicUsize::new(0));
+    static TWO_USE_ADMISSION_POLICY: LazyLock<admission::MinUsesAdmissionPolicy> =
+        LazyLock::new(|| admission::MinUsesAdmissionPolicy::new(NonZeroU32::new(2).unwrap()));
+
+    impl AdmissionPolicy for CountingDeferPolicy {
+        fn observe(&self, _key: &CacheKey) -> Decision {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Decision::Defer { observed: 1 }
+        }
+    }
+
+    impl AdmissionPolicy for CountingReadyPolicy {
+        fn observe(&self, _key: &CacheKey) -> Decision {
+            let observed = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+            Decision::Ready {
+                observed: observed as u32,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl storage::HandleHit for EmptyHitHandler {
+        async fn read_body(&mut self) -> Result<Option<bytes::Bytes>> {
+            Ok(None)
+        }
+
+        async fn finish(
+            self: Box<Self>,
+            _storage: &'static (dyn Storage + Sync),
+            _key: &CacheKey,
+            _trace: &trace::SpanHandle,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync) {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Storage for UpdateOkStorage {
+        async fn lookup(
+            &'static self,
+            _key: &CacheKey,
+            _trace: &trace::SpanHandle,
+        ) -> Result<Option<(CacheMeta, HitHandler)>> {
+            Ok(None)
+        }
+
+        async fn get_miss_handler(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<MissHandler> {
+            unreachable!("tests do not write bodies through this storage")
+        }
+
+        async fn purge(
+            &'static self,
+            _key: &CompactCacheKey,
+            _purge_type: PurgeType,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn update_meta(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Storage for OneShotLookupStorage {
+        async fn lookup(
+            &'static self,
+            key: &CacheKey,
+            _trace: &trace::SpanHandle,
+        ) -> Result<Option<(CacheMeta, HitHandler)>> {
+            let compact_key = key.to_compact();
+            let mut entries = self.entries.lock().unwrap();
+            let Some(pos) = entries
+                .iter()
+                .position(|(entry_key, _)| entry_key == &compact_key)
+            else {
+                return Ok(None);
+            };
+            let (_, meta) = entries.remove(pos);
+            Ok(Some((meta, Box::new(EmptyHitHandler))))
+        }
+
+        async fn get_miss_handler(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<MissHandler> {
+            unreachable!("tests do not write bodies through this storage")
+        }
+
+        async fn purge(
+            &'static self,
+            _key: &CompactCacheKey,
+            _purge_type: PurgeType,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn update_meta(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
+            self
+        }
+    }
+
+    fn test_meta(created: SystemTime) -> CacheMeta {
+        let header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        CacheMeta::new(created + Duration::from_secs(60), created, 30, 30, header)
+    }
+
+    fn cache_with_stale_meta(meta: CacheMeta, key: CacheKey) -> HttpCache {
+        let mut cache = HttpCache::new();
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_cache_key(key);
+        cache.phase = CachePhase::Stale;
+        cache.inner_enabled_mut().meta = Some(meta);
+        cache
+    }
+
+    fn cache_with_lookup_storage(key: CacheKey) -> HttpCache {
+        let mut cache = HttpCache::new();
+        cache.enable(&ONE_SHOT_LOOKUP_STORAGE, None, None, None, None);
+        cache.set_cache_key(key);
+        cache
+    }
+
+    #[tokio::test]
+    async fn raw_storage_miss_can_defer_admission() {
+        RAW_MISS_DEFER_POLICY.0.store(0, Ordering::Relaxed);
+        let mut cache = HttpCache::new();
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_admission_policy(&RAW_MISS_DEFER_POLICY);
+        cache.set_cache_key(CacheKey::new("deferred-storage-miss", ""));
+
+        assert!(cache.cache_lookup().await.unwrap().is_none());
+        assert_eq!(cache.phase(), CachePhase::Disabled(NoCacheReason::Deferred));
+        assert_eq!(
+            cache.admission_decision(),
+            Some(Decision::Defer { observed: 1 })
+        );
+        assert_eq!(RAW_MISS_DEFER_POLICY.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn second_storage_miss_can_proceed_to_fill() {
+        let key = CacheKey::new("two-use-admission", "");
+
+        let mut first = HttpCache::new();
+        first.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        first.set_admission_policy(&*TWO_USE_ADMISSION_POLICY);
+        first.set_cache_key(key.clone());
+        assert!(first.cache_lookup().await.unwrap().is_none());
+        assert_eq!(first.phase(), CachePhase::Disabled(NoCacheReason::Deferred));
+
+        let mut second = HttpCache::new();
+        second.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        second.set_admission_policy(&*TWO_USE_ADMISSION_POLICY);
+        second.set_cache_key(key);
+        assert!(second.cache_lookup().await.unwrap().is_none());
+        assert_eq!(
+            second.admission_decision(),
+            Some(Decision::Ready { observed: 2 })
+        );
+        assert_eq!(second.phase(), CachePhase::CacheKey);
+        second.cache_miss();
+        assert_eq!(second.phase(), CachePhase::Miss);
+    }
+
+    #[tokio::test]
+    async fn repeated_raw_miss_is_observed_once_per_request() {
+        RAW_MISS_READY_POLICY.0.store(0, Ordering::Relaxed);
+        let mut cache = HttpCache::new();
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_admission_policy(&RAW_MISS_READY_POLICY);
+        cache.set_cache_key(CacheKey::new("repeated-ready-admission", ""));
+
+        assert!(cache.cache_lookup().await.unwrap().is_none());
+        assert!(cache.cache_lookup().await.unwrap().is_none());
+        assert_eq!(RAW_MISS_READY_POLICY.0.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cache.admission_decision(),
+            Some(Decision::Ready { observed: 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_refill_does_not_observe_admission() {
+        STALE_DEFER_POLICY.0.store(0, Ordering::Relaxed);
+        let key = CacheKey::new("stale-refill-admission", "");
+        let mut cache = HttpCache::new();
+        cache.enable(&UPDATE_OK_STORAGE, None, None, None, None);
+        cache.set_admission_policy(&STALE_DEFER_POLICY);
+        cache.set_cache_key(key);
+        cache.phase = CachePhase::Stale;
+        cache.inner_enabled_mut().meta = Some(test_meta(SystemTime::now()));
+
+        assert!(cache.cache_lookup().await.unwrap().is_none());
+        assert_eq!(STALE_DEFER_POLICY.0.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.admission_decision(), None);
+        cache.cache_miss();
+        assert_eq!(cache.phase(), CachePhase::Miss);
+    }
+
+    #[tokio::test]
+    async fn valid_after_rejection_does_not_observe_admission() {
+        VALID_AFTER_DEFER_POLICY.0.store(0, Ordering::Relaxed);
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let key = CacheKey::new("valid-after-not-admission", "");
+        ONE_SHOT_LOOKUP_STORAGE
+            .entries
+            .lock()
+            .unwrap()
+            .push((key.to_compact(), test_meta(created)));
+
+        let mut cache = HttpCache::new();
+        cache.enable(&ONE_SHOT_LOOKUP_STORAGE, None, None, None, None);
+        cache.set_admission_policy(&VALID_AFTER_DEFER_POLICY);
+        cache.set_cache_key(key);
+        cache.inner_enabled_mut().valid_after = Some(created + Duration::from_secs(1));
+
+        assert!(cache.cache_lookup().await.unwrap().is_none());
+        assert_eq!(cache.phase(), CachePhase::CacheKey);
+        assert_eq!(cache.admission_decision(), None);
+        assert_eq!(VALID_AFTER_DEFER_POLICY.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_set_cache_meta_preserves_stale_provenance() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let variance = [1; 16];
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        old_meta.set_variance_key(variance);
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("preserve", ""));
+
+        cache.set_cache_meta(test_meta(refresh));
+
+        assert_eq!(cache.phase(), CachePhase::Expired);
+        assert_eq!(cache.cache_meta().created(), refresh);
+        assert_eq!(cache.cache_meta().provenance(), family_start);
+        assert_eq!(cache.inner_enabled().stale_meta_variance, Some(variance));
+    }
+
+    #[tokio::test]
+    async fn test_revalidate_cache_meta_preserves_created_and_provenance() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let revalidated_at = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("revalidate", ""));
+
+        cache
+            .revalidate_cache_meta(test_meta(revalidated_at))
+            .await
+            .unwrap();
+
+        assert_eq!(cache.phase(), CachePhase::Revalidated);
+        assert_eq!(cache.cache_meta().created(), created);
+        assert_eq!(cache.cache_meta().updated(), revalidated_at);
+        assert_eq!(cache.cache_meta().provenance(), family_start);
+    }
+
+    #[test]
+    fn test_update_variance_preserves_provenance_when_primary_variance_unchanged() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let variance = [1; 16];
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        old_meta.set_variance_key(variance);
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("same-vary", ""));
+
+        cache.set_cache_meta(test_meta(refresh));
+        cache.update_variance(Some(variance));
+
+        assert_eq!(cache.cache_meta().provenance(), family_start);
+        assert_eq!(cache.cache_meta().variance(), Some(variance));
+        assert!(cache.cache_key().get_variance_key().is_none());
+    }
+
+    #[test]
+    fn test_update_variance_resets_provenance_when_primary_variance_changes() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let old_variance = [1; 16];
+        let new_variance = [2; 16];
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        old_meta.set_variance_key(old_variance);
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("changed-vary", ""));
+
+        cache.set_cache_meta(test_meta(refresh));
+        cache.update_variance(Some(new_variance));
+
+        assert_eq!(cache.cache_meta().provenance(), refresh);
+        assert_eq!(cache.cache_meta().variance(), Some(new_variance));
+        assert!(cache.cache_key().get_variance_key().is_none());
+    }
+
+    #[test]
+    fn test_update_variance_resets_provenance_when_primary_variance_appears() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let variance = [1; 16];
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("vary-appears", ""));
+
+        cache.set_cache_meta(test_meta(refresh));
+        cache.update_variance(Some(variance));
+
+        assert_eq!(cache.cache_meta().provenance(), refresh);
+        assert_eq!(cache.cache_meta().variance(), Some(variance));
+        assert!(cache.cache_key().get_variance_key().is_none());
+    }
+
+    #[test]
+    fn test_update_variance_resets_provenance_when_secondary_takes_primary_slot() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let old_variance = [1; 16];
+        let mut key = CacheKey::new("secondary-takeover", "");
+        key.set_variance_key(old_variance);
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        old_meta.set_variance_key(old_variance);
+        let mut cache = cache_with_stale_meta(old_meta, key);
+
+        cache.set_cache_meta(test_meta(refresh));
+        cache.update_variance(None);
+
+        assert_eq!(cache.cache_meta().provenance(), refresh);
+        assert!(cache.cache_meta().variance().is_none());
+        assert!(cache.cache_key().get_variance_key().is_none());
+    }
+
+    #[test]
+    fn test_update_variance_preserves_provenance_when_secondary_variance_unchanged() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+        let refresh = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let variance = [1; 16];
+        let mut key = CacheKey::new("secondary-same-vary", "");
+        key.set_variance_key(variance);
+
+        let mut old_meta = test_meta(created);
+        old_meta.set_provenance(family_start);
+        old_meta.set_variance_key(variance);
+        let mut cache = cache_with_stale_meta(old_meta, key);
+
+        cache.set_cache_meta(test_meta(refresh));
+        cache.update_variance(Some(variance));
+
+        assert_eq!(cache.cache_meta().provenance(), family_start);
+        assert_eq!(cache.cache_meta().variance(), Some(variance));
+        assert_eq!(cache.cache_key().get_variance_key(), Some(&variance));
+    }
+
+    #[tokio::test]
+    async fn test_cache_vary_lookup_uses_provenance_for_valid_after() {
+        let family_start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let secondary_created = SystemTime::UNIX_EPOCH + Duration::from_secs(150);
+        let primary_refreshed = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+        let primary_variance = [1; 16];
+        let secondary_variance = [2; 16];
+
+        let mut primary_meta = test_meta(primary_refreshed);
+        primary_meta.set_provenance(family_start);
+        primary_meta.set_variance_key(primary_variance);
+
+        let mut secondary_meta = test_meta(secondary_created);
+        secondary_meta.set_provenance(family_start);
+        secondary_meta.set_variance_key(secondary_variance);
+
+        let mut cache = cache_with_lookup_storage(CacheKey::new("valid-after-provenance", ""));
+        assert!(!cache.cache_vary_lookup(secondary_variance, &primary_meta));
+        assert_eq!(
+            cache.inner_enabled().valid_after,
+            Some(primary_meta.provenance())
+        );
+
+        let secondary_key = cache.cache_key().to_compact();
+        ONE_SHOT_LOOKUP_STORAGE
+            .entries
+            .lock()
+            .unwrap()
+            .push((secondary_key, secondary_meta));
+
+        assert!(cache.cache_lookup().await.unwrap().is_some());
     }
 }

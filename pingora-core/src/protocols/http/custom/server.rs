@@ -46,6 +46,36 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool>;
 
+    /// Whether the cancel-safe proxy task API is enabled for this session.
+    fn proxy_tasks_enabled(&self) -> bool {
+        false
+    }
+
+    /// Enable or disable the cancel-safe proxy task API for this session.
+    fn set_proxy_tasks_enabled(&mut self, _enabled: bool) {}
+
+    /// Queue a proxy task for cancel-safe writing.
+    ///
+    /// # Panics
+    /// Panics if the Custom session does not implement the proxy task API.
+    #[track_caller]
+    fn send_proxy_task(&mut self, _task: HttpTask) {
+        panic!("Custom proxy task API not implemented")
+    }
+
+    /// Whether there are pending proxy tasks queued for writing.
+    fn has_pending_proxy_tasks(&self) -> bool {
+        false
+    }
+
+    /// Write queued proxy tasks in a cancel-safe manner.
+    ///
+    /// # Panics
+    /// Panics if the Custom session does not implement the proxy task API.
+    async fn write_proxy_tasks(&mut self) -> Result<bool> {
+        panic!("Custom proxy task API not implemented")
+    }
+
     fn set_read_timeout(&mut self, timeout: Option<Duration>);
 
     fn get_read_timeout(&self) -> Option<Duration>;

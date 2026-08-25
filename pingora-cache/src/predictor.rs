@@ -14,7 +14,7 @@
 
 //! Cacheability Predictor
 
-use crate::hashtable::{ConcurrentLruCache, LruShard};
+use crate::hashtable::ConcurrentLruCache;
 
 pub type CustomReasonPredicate = fn(&'static str) -> bool;
 
@@ -53,14 +53,7 @@ pub trait CacheablePredictor {
     fn mark_uncacheable(&self, key: &CacheKey, reason: NoCacheReason) -> Option<bool>;
 }
 
-// This particular bit of `where [LruShard...; N]: Default` nonsense arises from
-// ConcurrentLruCache needing this trait bound, which in turns arises from the Rust
-// compiler not being able to guarantee that all array sizes N implement `Default`.
-// See https://github.com/rust-lang/rust/issues/61415
-impl<const N_SHARDS: usize> Predictor<N_SHARDS>
-where
-    [LruShard<()>; N_SHARDS]: Default,
-{
+impl<const N_SHARDS: usize> Predictor<N_SHARDS> {
     /// Create a new Predictor with `N_SHARDS * shard_capacity` total capacity for
     /// uncacheable cache keys.
     ///
@@ -80,10 +73,7 @@ where
     }
 }
 
-impl<const N_SHARDS: usize> CacheablePredictor for Predictor<N_SHARDS>
-where
-    [LruShard<()>; N_SHARDS]: Default,
-{
+impl<const N_SHARDS: usize> CacheablePredictor for Predictor<N_SHARDS> {
     fn cacheable_prediction(&self, key: &CacheKey) -> bool {
         // variance key is ignored because this check happens before cache lookup
         let hash = key.primary_bin();
@@ -125,6 +115,7 @@ where
             | Deferred
             | CacheLockGiveUp
             | CacheLockTimeout
+            | CacheLockRetryLimit
             | DeclinedToUpstream
             | UpstreamError
             | PredictedResponseTooLarge => {
@@ -159,7 +150,7 @@ mod tests {
     #[test]
     fn test_mark_cacheability() {
         let predictor = Predictor::<1>::new(10, None);
-        let key = CacheKey::new("a", "b", "c");
+        let key = CacheKey::new("b", "c");
         // cacheable if no history
         assert!(predictor.cacheable_prediction(&key));
 
@@ -184,7 +175,7 @@ mod tests {
             10,
             Some(|custom_reason| matches!(custom_reason, "Skipping")),
         );
-        let key = CacheKey::new("a", "b", "c");
+        let key = CacheKey::new("b", "c");
         // cacheable if no history
         assert!(predictor.cacheable_prediction(&key));
 
@@ -196,7 +187,7 @@ mod tests {
         predictor.mark_uncacheable(&key, NoCacheReason::Custom("DontCacheMe"));
         assert!(!predictor.cacheable_prediction(&key));
 
-        let key = CacheKey::new("a", "c", "d");
+        let key = CacheKey::new("c", "d");
         assert!(predictor.cacheable_prediction(&key));
         // specific custom reason is skipped
         predictor.mark_uncacheable(&key, NoCacheReason::Custom("Skipping"));
@@ -206,22 +197,22 @@ mod tests {
     #[test]
     fn test_mark_uncacheable_lru() {
         let predictor = Predictor::<1>::new(3, None);
-        let key1 = CacheKey::new("a", "b", "c");
+        let key1 = CacheKey::new("b", "c");
         predictor.mark_uncacheable(&key1, NoCacheReason::OriginNotCache);
         assert!(!predictor.cacheable_prediction(&key1));
 
-        let key2 = CacheKey::new("a", "bc", "c");
+        let key2 = CacheKey::new("bc", "c");
         predictor.mark_uncacheable(&key2, NoCacheReason::OriginNotCache);
         assert!(!predictor.cacheable_prediction(&key2));
 
-        let key3 = CacheKey::new("a", "cd", "c");
+        let key3 = CacheKey::new("cd", "c");
         predictor.mark_uncacheable(&key3, NoCacheReason::OriginNotCache);
         assert!(!predictor.cacheable_prediction(&key3));
 
         // promote / reinsert key1
         predictor.mark_uncacheable(&key1, NoCacheReason::OriginNotCache);
 
-        let key4 = CacheKey::new("a", "de", "c");
+        let key4 = CacheKey::new("de", "c");
         predictor.mark_uncacheable(&key4, NoCacheReason::OriginNotCache);
         assert!(!predictor.cacheable_prediction(&key4));
 
@@ -231,5 +222,21 @@ mod tests {
         assert!(predictor.cacheable_prediction(&key2));
         assert!(!predictor.cacheable_prediction(&key3));
         assert!(!predictor.cacheable_prediction(&key4));
+    }
+
+    #[test]
+    fn test_shard_count_above_32() {
+        // The stdlib only auto-derives `Default` for arrays up to N=32, which
+        // previously capped the shard count. This exercises a shard count well
+        // above 32 to ensure the `arrayvec`-based construction supports any N.
+        let predictor = Predictor::<64>::new(10, None);
+        let key = CacheKey::new("b", "c");
+        assert!(predictor.cacheable_prediction(&key));
+
+        predictor.mark_uncacheable(&key, NoCacheReason::OriginNotCache);
+        assert!(!predictor.cacheable_prediction(&key));
+
+        predictor.mark_cacheable(&key);
+        assert!(predictor.cacheable_prediction(&key));
     }
 }
