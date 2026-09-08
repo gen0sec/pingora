@@ -118,6 +118,13 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn enable_retry_buffering(&mut self);
 
+    /// Widen the retry buffer for this session. Defaulted so existing custom
+    /// sessions keep compiling; `false` means the request cannot be fully
+    /// retained and the caller should not rely on replaying its body.
+    fn enable_retry_buffering_with_limit(&mut self, _limit: usize) -> bool {
+        false
+    }
+
     fn retry_buffer_truncated(&self) -> bool;
 
     fn get_retry_buffer(&self) -> Option<Bytes>;

@@ -672,6 +672,23 @@ impl Session {
         }
     }
 
+    /// Enable retry buffering with a capacity other than the 64 KB default.
+    ///
+    /// Returns whether the limit took effect — `false` if the buffer has
+    /// already started filling (or the session cannot retain a body), in which
+    /// case the body must not be assumed replayable. Callers that need the
+    /// whole body available after reading it — inspecting a request before
+    /// letting it reach the upstream, for instance — should check this and fall
+    /// back to streaming when it is `false`.
+    pub fn enable_retry_buffering_with_limit(&mut self, limit: usize) -> bool {
+        match self {
+            Self::H1(s) => s.enable_retry_buffering_with_limit(limit),
+            Self::H2(s) => s.enable_retry_buffering_with_limit(limit),
+            Self::Subrequest(s) => s.enable_retry_buffering_with_limit(limit),
+            Self::Custom(s) => s.enable_retry_buffering_with_limit(limit),
+        }
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         match self {
             Self::H1(s) => s.get_retry_buffer(),
