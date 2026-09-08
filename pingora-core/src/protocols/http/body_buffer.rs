@@ -53,6 +53,24 @@ impl FixedBuffer {
     pub fn is_empty(&self) -> bool {
         self.buffer.len() == 0
     }
+    /// Raise (or lower) the capacity of a buffer that has not started filling.
+    ///
+    /// Only meaningful before any body byte has been written: once data is in,
+    /// changing the ceiling cannot un-truncate what was already dropped, so
+    /// this leaves a non-empty buffer alone and reports `false`.
+    ///
+    /// Exists so a caller that needs the whole body retained — a proxy holding
+    /// a request back for content inspection, say — can widen the ceiling for
+    /// the requests it cares about, instead of every deployment paying a larger
+    /// default.
+    pub fn set_capacity(&mut self, capacity: usize) -> bool {
+        if !self.buffer.is_empty() || self.truncated {
+            return false;
+        }
+        self.capacity = capacity;
+        true
+    }
+
     pub fn is_truncated(&self) -> bool {
         self.truncated
     }
@@ -81,5 +99,34 @@ mod tests {
         assert!(buffer.is_truncated());
         assert_eq!(buffer.buffer.capacity(), 0);
         assert!(buffer.get_buffer().is_none());
+    }
+
+    #[test]
+    fn raised_capacity_retains_a_body_the_default_would_truncate() {
+        let mut buf = FixedBuffer::new(4);
+        assert!(buf.set_capacity(16));
+
+        buf.write_to_buffer(&Bytes::from_static(b"0123456789"));
+        assert!(!buf.is_truncated());
+        assert_eq!(buf.get_buffer().unwrap(), Bytes::from_static(b"0123456789"));
+    }
+
+    /// Widening after bytes have landed cannot recover anything already
+    /// dropped, so the change is refused rather than silently reporting a whole
+    /// body that is actually a prefix.
+    #[test]
+    fn capacity_change_is_refused_once_the_buffer_has_data() {
+        let mut buf = FixedBuffer::new(8);
+        buf.write_to_buffer(&Bytes::from_static(b"abc"));
+        assert!(!buf.set_capacity(1024));
+    }
+
+    #[test]
+    fn capacity_change_is_refused_after_truncation() {
+        let mut buf = FixedBuffer::new(2);
+        buf.write_to_buffer(&Bytes::from_static(b"abcdef"));
+        assert!(buf.is_truncated());
+        assert!(!buf.set_capacity(1024));
+        assert!(buf.is_truncated(), "still truncated after a refused resize");
     }
 }

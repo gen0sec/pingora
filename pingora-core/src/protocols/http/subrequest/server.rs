@@ -587,6 +587,17 @@ impl HttpSession {
         }
     }
 
+    /// See [`crate::protocols::http::v1::server::HttpSession::enable_retry_buffering_with_limit`].
+    pub fn enable_retry_buffering_with_limit(&mut self, limit: usize) -> bool {
+        match self.retry_buffer.as_mut() {
+            Some(buffer) => buffer.set_capacity(limit),
+            None => {
+                self.retry_buffer = Some(FixedBuffer::new(limit));
+                true
+            }
+        }
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         self.retry_buffer.as_ref().and_then(|b| {
             if b.is_truncated() {

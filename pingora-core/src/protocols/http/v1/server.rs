@@ -1158,6 +1158,26 @@ impl HttpSession {
         }
     }
 
+    /// Enable retry buffering with a capacity other than [`BODY_BUF_LIMIT`],
+    /// creating the buffer if it does not exist yet or widening one that has
+    /// not started filling. Returns whether the limit is now in effect.
+    ///
+    /// The default stays 64 KB: raising it globally would make every request
+    /// body up to the new ceiling be retained, since the proxy enables retry
+    /// buffering unconditionally. This lets a caller opt specific requests into
+    /// full retention — a proxy that must inspect a body before releasing it
+    /// upstream needs the whole thing, and a truncated buffer cannot be
+    /// replayed at all.
+    pub fn enable_retry_buffering_with_limit(&mut self, limit: usize) -> bool {
+        match self.retry_buffer.as_mut() {
+            Some(buffer) => buffer.set_capacity(limit),
+            None => {
+                self.retry_buffer = Some(FixedBuffer::new(limit));
+                true
+            }
+        }
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         self.retry_buffer.as_ref().and_then(|b| {
             if b.is_truncated() {
