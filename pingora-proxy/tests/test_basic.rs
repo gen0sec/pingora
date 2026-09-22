@@ -905,14 +905,12 @@ async fn test_connect_proxying_allowed_h1_without_host() {
     assert_connect_tunnel_response(&buf, b"ok");
 }
 
-#[tokio::test]
-async fn test_connect_proxying_allowed_h1_tunnels_both_ways() {
-    init();
-
+/// Spawn an h1 origin that accepts one CONNECT, echoes the tunnel, and once the client
+/// half-closes sends `bye` and closes. Returns its port and the CONNECT request header it got.
+async fn spawn_h1_connect_origin() -> (u16, tokio::sync::oneshot::Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream_addr = listener.local_addr().unwrap();
-
-    // An origin that accepts the CONNECT and then echoes the tunnel until the client closes.
+    let port = listener.local_addr().unwrap().port();
+    let (header_tx, header_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut req = vec![];
@@ -925,7 +923,7 @@ async fn test_connect_proxying_allowed_h1_tunnels_both_ways() {
                 break i + 4;
             }
         };
-        assert!(req.starts_with(b"CONNECT pingora.org:443 HTTP/1.1\r\n"));
+        let _ = header_tx.send(req[..header_end].to_vec());
         socket
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
@@ -939,14 +937,47 @@ async fn test_connect_proxying_allowed_h1_tunnels_both_ways() {
             }
             socket.write_all(&buf[..n]).await.unwrap();
         }
+        // the client half-closed: the tunnel still carries the rest of our side
+        socket.write_all(b"bye").await.unwrap();
         let _ = socket.shutdown().await;
     });
+    (port, header_rx)
+}
 
+/// Spawn an h2c origin that accepts one CONNECT stream, echoes the tunnel, and once the
+/// client ends its side sends `bye` and ends the stream.
+async fn spawn_h2_connect_origin() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(socket).await.unwrap();
+        let (req, mut respond) = conn.accept().await.unwrap().unwrap();
+        tokio::spawn(async move { while conn.accept().await.is_some() {} });
+        assert_eq!(req.method(), http::Method::CONNECT);
+        let mut send = respond
+            .send_response(Response::builder().status(200).body(()).unwrap(), false)
+            .unwrap();
+        let mut body = req.into_body();
+        while let Some(data) = body.data().await {
+            let data = data.unwrap();
+            let _ = body.flow_control().release_capacity(data.len());
+            send.send_data(data, false).unwrap();
+        }
+        send.send_data(Bytes::from_static(b"bye"), true).unwrap();
+        // keep the stream alive until the proxy has read it
+        let _ = futures::future::poll_fn(|cx| send.poll_reset(cx)).await;
+    });
+    port
+}
+
+/// Run a tunnel through the CONNECT proxy from an h1 client: send `early` along with the
+/// request, echo `ping`, half-close, and expect the rest of the upstream side (`bye`).
+async fn h1_connect_tunnel(upstream_port: u16, upstream_h2: bool) {
     let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
     // "early" is sent before the client has seen the response
     let request = format!(
-        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {}\r\n\r\nearly",
-        upstream_addr.port()
+        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {upstream_port}\r\nX-H2: {upstream_h2}\r\n\r\nearly"
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
@@ -955,10 +986,101 @@ async fn test_connect_proxying_allowed_h1_tunnels_both_ways() {
     stream.write_all(b"ping").await.unwrap();
     read_until_suffix(&mut stream, &mut resp, b"ping").await;
 
-    // closing our side ends the tunnel
+    // closing our side ends our half of the tunnel only
     stream.shutdown().await.unwrap();
     stream.read_to_end(&mut resp).await.unwrap();
-    assert_connect_tunnel_response(&resp, b"earlyping");
+    assert_connect_tunnel_response(&resp, b"earlypingbye");
+}
+
+/// Same as [`h1_connect_tunnel`] from an h2 client, which sends `early` as DATA before the
+/// response and half-closes with END_STREAM.
+async fn h2_connect_tunnel(upstream_port: u16, upstream_h2: bool) {
+    let tcp = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    let (mut h2, connection) = client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = Request::builder()
+        .method("CONNECT")
+        .uri("http://pingora.org:443/")
+        .header("x-port", upstream_port.to_string())
+        .header("x-h2", upstream_h2.to_string())
+        .body(())
+        .unwrap();
+    let (response, mut send) = h2.send_request(request, false).unwrap();
+    send.send_data(Bytes::from_static(b"early"), false).unwrap();
+    let (head, mut body) = response.await.unwrap().into_parts();
+    assert_eq!(head.status.as_u16(), 200);
+    assert!(head.headers.get("content-length").is_none());
+
+    let mut tunnel = vec![];
+    let mut read_until = async |tunnel: &mut Vec<u8>, suffix: &[u8]| {
+        while !tunnel.ends_with(suffix) {
+            let data = body.data().await.expect("tunnel ended early").unwrap();
+            let _ = body.flow_control().release_capacity(data.len());
+            tunnel.extend_from_slice(&data);
+        }
+    };
+    read_until(&mut tunnel, b"early").await;
+    send.send_data(Bytes::from_static(b"ping"), false).unwrap();
+    read_until(&mut tunnel, b"ping").await;
+
+    // END_STREAM ends our half of the tunnel only
+    send.send_data(Bytes::new(), true).unwrap();
+    read_until(&mut tunnel, b"bye").await;
+    // the stream may end with an empty DATA frame
+    while let Some(data) = body.data().await {
+        assert!(data.unwrap().is_empty(), "tunnel should end after bye");
+    }
+    assert_eq!(tunnel, b"earlypingbye");
+}
+
+/// Fail a tunnel test that stalls instead of hanging the suite.
+async fn with_tunnel_timeout(tunnel: impl std::future::Future<Output = ()>) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), tunnel)
+        .await
+        .expect("tunnel stalled");
+}
+
+fn assert_connect_forwarded_without_framing(header: &[u8]) {
+    let header = std::str::from_utf8(header).unwrap().to_ascii_lowercase();
+    assert!(
+        header.starts_with("connect pingora.org:443 http/1.1\r\n"),
+        "{header}"
+    );
+    assert!(!header.contains("content-length"), "{header}");
+    assert!(!header.contains("transfer-encoding"), "{header}");
+}
+
+#[tokio::test]
+async fn test_connect_proxying_tunnel_h1_to_h1() {
+    init();
+    let (port, header) = spawn_h1_connect_origin().await;
+    with_tunnel_timeout(h1_connect_tunnel(port, false)).await;
+    assert_connect_forwarded_without_framing(&header.await.unwrap());
+}
+
+#[tokio::test]
+async fn test_connect_proxying_tunnel_h1_to_h2() {
+    init();
+    let port = spawn_h2_connect_origin().await;
+    with_tunnel_timeout(h1_connect_tunnel(port, true)).await;
+}
+
+#[tokio::test]
+async fn test_connect_proxying_tunnel_h2_to_h1() {
+    init();
+    let (port, header) = spawn_h1_connect_origin().await;
+    with_tunnel_timeout(h2_connect_tunnel(port, false)).await;
+    assert_connect_forwarded_without_framing(&header.await.unwrap());
+}
+
+#[tokio::test]
+async fn test_connect_proxying_tunnel_h2_to_h2() {
+    init();
+    let port = spawn_h2_connect_origin().await;
+    with_tunnel_timeout(h2_connect_tunnel(port, true)).await;
 }
 
 /// Read from `stream` into `resp` until it ends with `suffix`.

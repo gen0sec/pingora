@@ -182,7 +182,13 @@ impl HttpSession {
     }
 
     fn maybe_force_close_body_reader(&mut self) {
-        if self.upgraded && self.received_upgrade_req_body && !self.body_reader.body_done() {
+        // A CONNECT tunnel half-closes instead: the server may still be sending after the
+        // client finished.
+        if self.upgraded
+            && !self.is_connect_req()
+            && self.received_upgrade_req_body
+            && !self.body_reader.body_done()
+        {
             // request is done, reset the response body to close
             self.body_reader.init_content_length(0, b"");
         }
@@ -191,11 +197,21 @@ impl HttpSession {
     /// Flush local buffer and notify the server by sending the last chunk if chunked encoding is
     /// used.
     pub async fn finish_body(&mut self) -> Result<Option<usize>> {
+        let was_finished = self.body_writer.finished();
         let res = self.body_writer.finish(&mut self.underlying_stream).await?;
         self.underlying_stream
             .flush()
             .await
             .or_err(WriteError, "flushing body")?;
+        if self.upgraded && self.is_connect_req() && self.received_upgrade_req_body && !was_finished
+        {
+            // Half-close the CONNECT tunnel: signal the end of the tunnel bytes to the server
+            // (a TCP FIN) while still reading what it sends.
+            self.underlying_stream
+                .shutdown()
+                .await
+                .or_err(WriteError, "shutting down CONNECT tunnel write side")?;
+        }
 
         self.maybe_force_close_body_reader();
         Ok(res)
