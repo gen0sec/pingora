@@ -46,8 +46,13 @@ pub use pingora_http::authority::{
 /// A caller must therefore not assume the two are byte-identical after this
 /// returns — notably when deriving a cache key or a routing decision from one
 /// of them. Authority bytes are otherwise opaque: no other normalization is
-/// applied, and a port that is not a plain number, or a value carrying more
-/// than one unbracketed colon, is never equal to anything.
+/// applied, so a port that is not a plain number, and a value carrying more
+/// than one unbracketed colon, are equal only to the identical bytes.
+///
+/// For an HTTP/2 request the scheme comes from the client's `:scheme`, which is not checked
+/// against the transport, so a client chooses which of the two default ports may fold. Inside
+/// pingora-proxy this is contained, because an H1 upstream request takes its `Host` from
+/// `:authority`, but a filter reading the request header can see the two differ by that port.
 ///
 /// HTTP/1 ingress and standard proxy egress call this;
 /// HTTP/2 performs equivalent stream-local checks.
@@ -101,8 +106,13 @@ pub fn validate_request_authority(req: &RequestHeader) -> Result<()> {
     Ok(())
 }
 
-/// Validate authority fields shared by H1 and H2 ingress.
-pub(super) fn validate_request_authority_fields(req: &RequestHeader) -> Result<()> {
+/// Validate the authority fields themselves: at most one `Host`, and no userinfo in either the
+/// `Host` header or the URI authority.
+///
+/// This is the part of [`validate_request_authority_fields`] that does not compare the two.
+/// A CONNECT target is reconciled against `Host` by
+/// [`validate_connect_target_authority`] instead, under its own byte-exact rule.
+pub(super) fn validate_request_authority_field_syntax(req: &RequestHeader) -> Result<()> {
     let mut hosts = req.headers.get_all(header::HOST).iter();
     let (host, duplicate_host) = (hosts.next(), hosts.next());
 
@@ -114,11 +124,23 @@ pub(super) fn validate_request_authority_fields(req: &RequestHeader) -> Result<(
         return Error::e_explain(InvalidHTTPHeader, "userinfo in Host header");
     }
 
-    let uri_authority = req.uri.authority().map(|authority| authority.as_str());
-    if uri_authority.is_some_and(|authority| authority.contains('@')) {
+    if req
+        .uri
+        .authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+    {
         return Error::e_explain(InvalidHTTPHeader, "userinfo in URI authority");
     }
 
+    Ok(())
+}
+
+/// Validate authority fields shared by H1 and H2 ingress.
+pub(super) fn validate_request_authority_fields(req: &RequestHeader) -> Result<()> {
+    validate_request_authority_field_syntax(req)?;
+
+    let host = req.headers.get(header::HOST);
+    let uri_authority = req.uri.authority().map(|authority| authority.as_str());
     let scheme = req.uri.scheme_str().map(|scheme| scheme.as_bytes());
     if host.zip(uri_authority).is_some_and(|(host, authority)| {
         !same_authority(host.as_bytes(), authority.as_bytes(), scheme)
@@ -200,6 +222,46 @@ fn validate_connect_authority(target: &[u8], host: Option<&HeaderValue>) -> Resu
     }
 }
 
+/// Validate a CONNECT target that is only an authority (`host:port`) against `Host`.
+///
+/// This is the rule [`validate_request_authority`] applies to an HTTP/1 authority-form CONNECT
+/// target, for callers that already hold the authority on its own, such as an HTTP/2
+/// `:authority`. Keeping the two on one rule stops the same CONNECT from being judged
+/// differently depending on the client's protocol version.
+///
+/// `Host` is reconciled byte-for-byte, not through [`same_authority`]: a CONNECT target names a
+/// tunnel destination rather than an origin to route within, so it is not widened by the
+/// case and default-port equivalences that apply elsewhere.
+pub(super) fn validate_connect_target_authority(
+    authority: &[u8],
+    host: Option<&HeaderValue>,
+) -> Result<()> {
+    if authority.contains(&b'@') {
+        return Error::e_explain(InvalidHTTPHeader, "userinfo in CONNECT authority");
+    }
+    if has_ambiguous_port_suffix(authority) {
+        return Error::e_explain(InvalidHTTPHeader, "ambiguous CONNECT request target");
+    }
+    match http::uri::Authority::try_from(authority) {
+        // A port-less authority carries no port to disagree about; H1 leaves what `Host` may
+        // then say to the application.
+        Ok(parsed) if parsed.port().is_none() => Ok(()),
+        Ok(parsed) => match host {
+            Some(host) => reconcile_connect_host(authority, parsed.host().as_bytes(), host),
+            None => Ok(()),
+        },
+        // An authority that does not parse cannot be reconciled by component, so it must match
+        // `Host` byte-for-byte, as H1 requires of the same target.
+        Err(_) => match host {
+            Some(host) => reconcile_connect_host(authority, authority, host),
+            None => Error::e_explain(
+                InvalidHTTPHeader,
+                "missing Host header for malformed CONNECT request target",
+            ),
+        },
+    }
+}
+
 /// Accept `Host` only when it names the complete CONNECT authority or its host component.
 ///
 /// The host-only form follows the [RFC 9112 section 3.2.3] example:
@@ -255,11 +317,12 @@ pub(super) fn same_authority(host: &[u8], target: &[u8], scheme: Option<&[u8]>) 
         return true;
     }
 
-    // The precondition this relies on, enforced rather than assumed. The
-    // target has been through `has_ambiguous_port_suffix` (CONNECT) or
-    // `Authority::try_from` (absolute form), but a `Host` header is parsed
-    // nowhere else, and the split below reads only the first unbracketed
-    // colon — where another parser may read the last.
+    // Neither side is assumed to have been parsed before reaching here: a custom-scheme
+    // absolute-form target skips `Authority::try_from`, an H2 `:authority` reaches this
+    // through no guard at all, and a `Host` header is parsed nowhere else. The split below
+    // reads only the first unbracketed colon, where another parser may read the last, so a
+    // multi-colon value must not reach it: on the target the split leaves a malformed port,
+    // which compares equal to nothing, and on `Host` this rejects outright.
     if has_ambiguous_port_suffix(host) {
         return false;
     }
