@@ -2,7 +2,8 @@
 # aws-sdk-s3-transfer-manager through the legacy rustls 0.21 chain used by
 # dial9's worker-s3 feature. No patch exists in 0.101.x; not reachable in
 # our usage because this is TLS client use only and does not parse CRLs.
-# Remove once the upstream aws-s3-transfer-manager-rs fix ships.
+# Remove once Pingora migrates to the Dial9 release line that removed
+# aws-sdk-s3-transfer-manager.
 
 [advisories]
 ignore = [

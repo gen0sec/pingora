@@ -23,7 +23,7 @@ use once_cell::sync::Lazy;
 use pingora_cache::admission::{AdmissionPolicy, Decision};
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::hashtable::ConcurrentHashTable;
-use pingora_cache::key::{CompactCacheKey, HashBinary};
+use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
 use pingora_cache::storage::{HandleMiss, MissFinishType, Storage};
 use pingora_cache::{
@@ -32,7 +32,7 @@ use pingora_cache::{
     NoCacheReason, RespCacheable,
 };
 use pingora_cache::{
-    CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeType, VarianceBuilder,
+    CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeAction, PurgeType, VarianceBuilder,
 };
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
@@ -365,6 +365,18 @@ impl ProxyHttp for ExampleProxyHttp {
         req: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
+        let host = session.get_header_bytes("host-override");
+        if !host.is_empty() {
+            req.insert_header("host", host)?;
+        }
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-upstream-delete-host")
+        {
+            req.remove_header(&http::header::HOST);
+        }
+
         // Test-only hook: deliberately declare a larger outbound body than the valid
         // downstream HTTP request contains. Built-in HTTP downstream parsing would reject
         // a client that directly ended a shorter-than-declared body; this hook lets tests
@@ -527,11 +539,11 @@ impl Storage for FinishFailCache {
 
     async fn purge(
         &'static self,
-        _key: &CompactCacheKey,
+        _target: pingora_cache::PurgeTarget<'_>,
         _purge_type: PurgeType,
         _trace: &pingora_cache::trace::SpanHandle,
-    ) -> Result<bool> {
-        Ok(false)
+    ) -> Result<pingora_cache::storage::PurgeOutcome> {
+        Ok(pingora_cache::storage::PurgeOutcome::NotFound)
     }
 
     async fn update_meta(
@@ -567,6 +579,17 @@ pub struct CacheCTX {
 }
 
 pub struct ExampleProxyCache {}
+
+static DOWNSTREAM_CACHE_WARN_LOG_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times the cache proxy has reported a downstream error that it ignored in order
+/// to let a cache fill finish.
+///
+/// Tests use this to wait for the proxy to actually observe a downstream error instead of
+/// sleeping for an arbitrary duration.
+pub fn downstream_cache_warn_log_calls() -> usize {
+    DOWNSTREAM_CACHE_WARN_LOG_CALLS.load(Ordering::Relaxed)
+}
 
 #[async_trait]
 impl ProxyHttp for ExampleProxyCache {
@@ -745,6 +768,18 @@ impl ProxyHttp for ExampleProxyCache {
 
         if session.get_header_bytes("x-force-expire") != b"" {
             return Ok(Some(ForcedFreshness::ForceExpired));
+        }
+
+        if session.get_header_bytes("x-force-expire-serve-stale") != b"" {
+            // `x-expired-secs-ago` backdates the expiry, which is how a test reaches an
+            // asset whose serve stale window has already run out at the point it expired.
+            let secs_ago = std::str::from_utf8(session.get_header_bytes("x-expired-secs-ago"))
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            return Ok(Some(ForcedFreshness::ForceExpiredServeStale {
+                expired_at: SystemTime::now().checked_sub(Duration::from_secs(secs_ago)),
+            }));
         }
         Ok(None)
     }
@@ -967,6 +1002,28 @@ impl ProxyHttp for ExampleProxyCache {
     fn is_purge(&self, session: &Session, _ctx: &Self::CTX) -> bool {
         session.req_header().method == "PURGE"
     }
+
+    fn purge_action(&self, session: &Session, _ctx: &Self::CTX) -> PurgeAction {
+        if session.get_header_bytes("x-purge-action") == b"expire" {
+            PurgeAction::Expire
+        } else {
+            PurgeAction::Delete
+        }
+    }
+
+    fn suppress_proxy_warn_log(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+        _error: &Error,
+        context: ProxyWarnLogContext,
+    ) -> bool {
+        if context == ProxyWarnLogContext::DownstreamCache {
+            DOWNSTREAM_CACHE_WARN_LOG_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        // only observing, keep the logging behavior unchanged
+        false
+    }
 }
 
 fn test_main() {
@@ -1070,6 +1127,18 @@ impl Server {
         let server_handle = thread::spawn(|| {
             test_main();
         });
+        let addr = "127.0.0.1:6147".parse().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test proxy failed to start within 10s"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
         Server {
             handle: server_handle,
         }
@@ -1163,6 +1232,14 @@ pub static TEST_SERVER: Lazy<Server> = Lazy::new(Server::start);
 #[cfg(feature = "s2n")]
 pub static TEST_PSK_TLS_SERVER: Lazy<PskTlsServer> = Lazy::new(PskTlsServer::start);
 use super::mock_origin::MOCK_ORIGIN;
+
+pub async fn init_proxy() {
+    tokio::task::spawn_blocking(|| {
+        let _ = *TEST_SERVER;
+    })
+    .await
+    .expect("test proxy startup task panicked");
+}
 
 pub fn init() {
     let _ = *TEST_SERVER;

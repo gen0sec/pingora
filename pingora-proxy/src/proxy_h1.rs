@@ -20,23 +20,26 @@ use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use pingora_cache::CachePhase;
 use pingora_core::protocols::http::{
-    custom::CUSTOM_MESSAGE_QUEUE_SIZE, v1::common::is_upgrade_req as is_h1_upgrade_req,
+    authority::{raw_target_authority, validate_request_authority},
+    custom::CUSTOM_MESSAGE_QUEUE_SIZE,
+    v1::common::is_upgrade_req as is_h1_upgrade_req,
 };
 
-impl<SV, C> HttpProxy<SV, C>
+impl<SV, C, DS> HttpProxy<SV, C, DS>
 where
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     pub(crate) async fn proxy_1to1(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         client_session: &mut HttpSessionV1,
         peer: &HttpPeer,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> (bool, bool, Option<Box<Error>>)
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         client_session.read_timeout = peer.options.read_timeout;
         client_session.write_timeout = peer.options.write_timeout;
@@ -44,15 +47,20 @@ where
         // phase 2 send to upstream
 
         let mut req = session.req_header().clone();
+        let authority_policy = AuthorityPolicy::from(session.downstream_session.is_custom());
+        let downstream_had_host = req.headers.contains_key(http::header::HOST);
         req.set_version(Version::HTTP_11);
 
-        // H2 is required to set :authority, but not necessarily Host; most H1 servers expect a
-        // Host header, so convert it when sending to H1.
-        if session.req_header().version == Version::HTTP_2
-            && session.get_header(header::HOST).is_none()
-        {
-            let host = req.uri.authority().map_or("", |a| a.as_str()).to_owned();
-            req.insert_header(header::HOST, host).unwrap();
+        // H2 requires :authority but not Host; most H1 servers expect Host, so synthesize it when
+        // sending an H2 downstream request to an H1 upstream.
+        if session.req_header().version == Version::HTTP_2 {
+            let result = match authority_policy {
+                AuthorityPolicy::Standard => set_h1_host_from_authority(&mut req),
+                AuthorityPolicy::Custom => set_h1_host_from_authority_if_absent(&mut req),
+            };
+            if let Err(e) = result {
+                return (false, true, Some(e.into_down()));
+            }
         }
 
         if let Err(e) = sanitize_h1_upstream_request(
@@ -79,6 +87,26 @@ where
             Ok(_) => { /* continue */ }
             Err(e) => {
                 return (false, true, Some(e));
+            }
+        }
+
+        // Reconcile and revalidate after request filters, which can mutate Host, URI, or target.
+        if authority_policy.is_standard() {
+            if let Err(e) = reconcile_upstream_authority(&mut req) {
+                return (false, true, Some(e.into_in()));
+            }
+            // A filter may delete Host. Restore it for requests that originally carried one or
+            // whose URI or absolute-form target has an authority, without adding a new empty Host
+            // to Host-less HTTP/1.0 origin-form.
+            let target_has_authority = raw_target_authority(req.raw_path()).authority().is_some();
+            if downstream_had_host || req.uri.authority().is_some() || target_has_authority {
+                if let Err(e) = set_h1_host_from_authority(&mut req) {
+                    return (false, true, Some(e.into_in()));
+                }
+            }
+            if let Err(e) = validate_request_authority(&req) {
+                // The final filter-produced request is invalid, so classify this as internal.
+                return (false, true, Some(e.into_in()));
             }
         }
 
@@ -166,16 +194,16 @@ where
 
     pub(crate) async fn proxy_to_h1_upstream(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         client_session: &mut HttpSessionV1,
         reused: bool,
         peer: &HttpPeer,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> (bool, bool, Option<Box<Error>>)
     // (reuse_server, reuse_client, error)
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         #[cfg(windows)]
         let raw = client_session.id() as std::os::windows::io::RawSocket;
@@ -206,6 +234,10 @@ where
         let upstream_bytes_total = client_session.body_bytes_received();
         session.set_upstream_body_bytes_received(upstream_bytes_total);
 
+        // Record request body bytes written to the upstream (payload only) for logging consumers.
+        // Only HTTP/1.x tracks this; see `Session::upstream_body_bytes_sent`.
+        session.set_upstream_body_bytes_sent(client_session.body_bytes_sent());
+
         // Record upstream write pending time for this session only (delta from baseline).
         let current_write_pending = client_session.stream().get_write_pending_time();
         let upstream_write_pending = current_write_pending.saturating_sub(initial_write_pending);
@@ -222,8 +254,8 @@ where
         pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let mut request_done = false;
         let mut response_done = false;
@@ -285,8 +317,9 @@ where
                             // Push the error to downstream and then quit
                             // Don't care if send fails: downstream already gone
                             let _ = tx.send(HttpTask::Failed(send_error.unwrap_or(e).into_up())).await;
-                            // Downstream should consume all remaining data and handle the error
-                            return Ok(upstream_can_reuse)
+                            // A response read error means the HTTP/1 message boundary was not
+                            // established successfully, so the connection cannot be reused.
+                            return Ok(false)
                         }
                     }
                 },
@@ -330,8 +363,8 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn process_upstream_tasks(
         &self,
-        session: &mut Session,
-        ctx: &mut SV::CTX,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         initial_task: HttpTask,
         rx: &mut mpsc::Receiver<HttpTask>,
         serve_from_cache: &mut ServeFromCache,
@@ -339,8 +372,8 @@ where
         response_state: &mut ResponseStateMachine,
     ) -> Result<Option<bool>>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         if serve_from_cache.should_discard_upstream() {
             // Serving the cached response and discarding the upstream one; nothing
@@ -411,10 +444,10 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn proxy_handle_downstream(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         tx: mpsc::Sender<HttpTask>,
         mut rx: mpsc::Receiver<HttpTask>,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
         downstream_custom_message_reader: &mut Option<
             Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
@@ -422,8 +455,8 @@ where
         pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // setup custom message forwarding, if downstream supports it
         let (
@@ -821,16 +854,16 @@ where
 
     async fn h1_response_filter(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         mut task: HttpTask,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut RangeBodyFilter,
         from_cache: bool, // are the task from cache already
     ) -> Result<HttpTask>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // skip caching if already served from cache
         if !from_cache {
@@ -941,7 +974,8 @@ where
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
-                    .response_body_filter(session, &mut data, end, ctx)?
+                    .response_body_filter(session, &mut data, end, ctx)
+                    .await?
                 {
                     trace!("delaying downstream response for {:?}", duration);
                     time::sleep(duration).await;
@@ -959,7 +993,8 @@ where
                 // range doesn't apply to upgraded body
                 if let Some(duration) = self
                     .inner
-                    .response_body_filter(session, &mut data, end, ctx)?
+                    .response_body_filter(session, &mut data, end, ctx)
+                    .await?
                 {
                     trace!("delaying downstream upgraded response for {:?}", duration);
                     time::sleep(duration).await;
@@ -987,15 +1022,15 @@ where
     // TODO:: use this function to replace send_body_to2
     async fn send_body_to_pipe(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         mut data: Option<Bytes>,
         end_of_body: bool,
         tx: mpsc::Permit<'_, HttpTask>,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> Result<bool>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // None: end of body
         // this var is to signal if downstream finish sending the body, which shouldn't be

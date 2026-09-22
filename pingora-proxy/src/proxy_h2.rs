@@ -20,76 +20,133 @@ use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use http::{header::CONTENT_LENGTH, Method, StatusCode};
 use pingora_cache::CachePhase;
+use pingora_core::protocols::http::authority::{
+    raw_target_authority, validate_request_authority, RawTargetAuthority,
+};
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
 
-// add scheme and authority as required by h2 lib
-fn update_h2_scheme_authority(
-    header: &mut http::request::Parts,
-    raw_host: &[u8],
-    tls: bool,
-) -> Result<()> {
-    let authority = if let Ok(s) = std::str::from_utf8(raw_host) {
-        if s.starts_with('[') {
-            // don't mess with ipv6 host
-            s
-        } else if let Some(colon) = s.find(':') {
-            if s.len() == colon + 1 {
-                // colon is the last char, ignore
-                s
-            } else if let Some(another_colon) = s[colon + 1..].find(':') {
-                // try to get rid of extra port numbers
-                &s[..colon + 1 + another_colon]
-            } else {
-                s
-            }
-        } else {
-            s
-        }
-    } else {
+/// Derive H2 `:path`, separating H1 absolute-form components ([RFC 9113 section 8.3.1]).
+///
+/// Reclassifies after filters and rejects non-UTF-8 or ambiguous targets.
+///
+/// [RFC 9113 section 8.3.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1
+fn h2_path_and_query(header: &RequestHeader) -> Result<http::uri::PathAndQuery> {
+    let target = header.raw_path();
+    if !header.raw_path_is_utf8() {
         return Error::e_explain(
             InvalidHTTPHeader,
-            format!("invalid authority from host {:?}", raw_host),
+            "non-UTF-8 request target cannot be forwarded over HTTP/2",
         );
+    }
+    let Some(uri_path_and_query) = header.uri.path_and_query() else {
+        return Ok(http::uri::PathAndQuery::from_static("/"));
     };
+    // Preserve origin-form and the server-wide `OPTIONS *` asterisk-form (RFC 9112 section 3.2.4).
+    // https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2.4
+    if target.starts_with(b"/") || target == b"*" {
+        return Ok(uri_path_and_query.clone());
+    }
+
+    // Origin-form and asterisk-form returned above; classify the remainder to extract an H1
+    // absolute-form path/query or reject ambiguous authority syntax.
+    let absolute_path_and_query = match raw_target_authority(target) {
+        RawTargetAuthority::None => return Ok(uri_path_and_query.clone()),
+        RawTargetAuthority::AmbiguousAuthority => {
+            return Error::e_explain(
+                InvalidHTTPHeader,
+                "ambiguous HTTP absolute-form request target",
+            )
+        }
+        RawTargetAuthority::Absolute { path_and_query, .. } => path_and_query,
+    };
+    if absolute_path_and_query.is_empty() {
+        return Ok(http::uri::PathAndQuery::from_static("/"));
+    }
+    if absolute_path_and_query.first() == Some(&b'?') {
+        let mut origin_form = Vec::with_capacity(absolute_path_and_query.len() + 1);
+        origin_form.push(b'/');
+        origin_form.extend_from_slice(absolute_path_and_query);
+        return http::uri::PathAndQuery::try_from(origin_form).or_err(
+            InvalidHTTPHeader,
+            "invalid query in absolute-form request target",
+        );
+    }
+    http::uri::PathAndQuery::try_from(absolute_path_and_query).or_err(
+        InvalidHTTPHeader,
+        "invalid path in absolute-form request target",
+    )
+}
+
+fn update_h2_scheme_authority(
+    header: &mut RequestHeader,
+    raw_host: &[u8],
+    tls: bool,
+    path_and_query: http::uri::PathAndQuery,
+) -> Result<()> {
+    let authority = http::uri::Authority::try_from(raw_host).map_err(|cause| {
+        Error::because(
+            InvalidHTTPHeader,
+            format!("invalid authority from Host {raw_host:?}"),
+            cause,
+        )
+    })?;
+    // Last guard before this authority is serialized on the wire.
+    if authority.as_str().contains('@') {
+        return Error::e_explain(InvalidHTTPHeader, "userinfo in Host header");
+    }
 
     let scheme = if tls { "https" } else { "http" };
     let uri = http::uri::Builder::new()
         .scheme(scheme)
         .authority(authority)
-        .path_and_query(header.uri.path_and_query().as_ref().unwrap().as_str())
+        .path_and_query(path_and_query)
         .build();
     match uri {
         Ok(uri) => {
-            header.uri = uri;
+            header.set_uri(uri);
             Ok(())
         }
         Err(_) => Error::e_explain(
             InvalidHTTPHeader,
-            format!("invalid authority from host {}", authority),
+            format!("failed to build H2 URI from Host {raw_host:?}"),
         ),
     }
 }
 
-impl<SV, C> HttpProxy<SV, C>
+impl<SV, C, DS> HttpProxy<SV, C, DS>
 where
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     pub(crate) async fn proxy_down_to_up(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         client_session: &mut Http2Session,
         peer: &HttpPeer,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> (bool, Option<Box<Error>>)
     // (reuse_server, error)
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let mut req = session.req_header().clone();
+        let authority_policy = AuthorityPolicy::from(session.downstream_session.is_custom());
 
-        if req.version != Version::HTTP_2 || session.downstream_session.is_custom() {
+        // A patched HTTP/1 parser can preserve non-UTF-8 request-target bytes, but `http::Uri`,
+        // which the H2 client API requires, cannot represent them. Reject client input as a
+        // downstream error before a filter has a chance to mutate the target. This wire-format
+        // constraint applies to both standard and custom downstream authority policies.
+        if !req.raw_path_is_utf8() {
+            let e = Error::explain(
+                InvalidHTTPHeader,
+                "non-UTF-8 request target cannot be forwarded over HTTP/2",
+            );
+            return (false, Some(e.into_down()));
+        }
+
+        if req.version != Version::HTTP_2 || authority_policy.is_custom() {
             if let Err(e) =
                 sanitize_h2_upstream_request(&mut req, peer.options.http_upstream_request_policy)
             {
@@ -126,6 +183,43 @@ where
             }
         }
 
+        if authority_policy.is_standard() {
+            if let Err(e) = reconcile_upstream_authority(&mut req) {
+                return (false, Some(e.into_in()));
+            }
+            if let Err(e) = validate_request_authority(&req) {
+                // The final filter-produced request is invalid, so classify this as internal.
+                return (false, Some(e.into_in()));
+            }
+        }
+
+        // A Host-less H1 absolute-form request still needs H2 :authority. Copy its raw target
+        // authority into local storage without inserting a temporary Host header.
+        let raw_authority =
+            if req.headers.get(http::header::HOST).is_none() && authority_policy.is_standard() {
+                raw_target_authority(req.raw_path())
+                    .authority()
+                    .map(<[u8]>::to_owned)
+            } else {
+                None
+            };
+        if req.headers.get(http::header::HOST).is_none()
+            && req.uri.authority().is_none()
+            && raw_authority.is_none()
+        {
+            // The final filter-produced request has no authority source.
+            let e = Error::explain(InvalidHTTPHeader, "no authority for H2 upstream request");
+            return (false, Some(e.into_in()));
+        }
+
+        // Run for every request, including Host-less HTTP/1.0, before conversion to
+        // `http::request::Parts` discards RequestHeader's raw byte fallback. A failure here after
+        // the initial check was produced by a filter and is therefore internal.
+        let path_and_query = match h2_path_and_query(&req) {
+            Ok(path_and_query) => path_and_query,
+            Err(e) => return (false, Some(e.into_in())),
+        };
+
         // Remove H1 `Host` header, save it in order to add to :authority
         // We do this because certain H2 servers expect request not to have a host header.
         // The `Host` is removed after the upstream filters above for 2 reasons
@@ -139,14 +233,20 @@ where
         // whether we support sending END_STREAM on HEADERS if body is empty
         let send_end_stream = req.send_end_stream().expect("req must be h2");
 
-        let mut req: http::request::Parts = req.into();
-
-        // H2 requires authority to be set, so copy that from H1 host if that is set
-        if let Some(host) = host {
-            if let Err(e) = update_h2_scheme_authority(&mut req, host.as_bytes(), peer.is_tls()) {
+        // Host is consumed locally to build :authority and is never sent on the H2 wire.
+        let authority = host
+            .as_ref()
+            .map(|host| host.as_bytes())
+            .or(raw_authority.as_deref());
+        if let Some(authority) = authority {
+            if let Err(e) =
+                update_h2_scheme_authority(&mut req, authority, peer.is_tls(), path_and_query)
+            {
                 return (false, Some(e));
             }
         }
+
+        let req: http::request::Parts = req.into();
 
         debug!("Request to h2: {req:?}");
 
@@ -241,14 +341,21 @@ where
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
             Err(e) => {
+                let upstream_read_timeout =
+                    e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout);
+                let downstream_error = e.esource == ErrorSource::Downstream;
                 // On application level upstream read timeouts, send RST_STREAM CANCEL,
-                // we know we have not received END_STREAM at this point since we read timed out
+                // we know we have not received END_STREAM at this point since we read timed out.
+                // Also cancel the upstream stream when downstream goes away/resets so the
+                // upstream peer can release the stream promptly.
                 // TODO: implement for write timeouts?
-                if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
+                if upstream_read_timeout || downstream_error {
                     client_body.send_reset(h2::Reason::CANCEL);
-                    // Mark the underlying H2 connection for shutdown so it's not used
-                    // for new streams in case it is hung.
-                    client_session.conn.mark_shutdown();
+                    if upstream_read_timeout {
+                        // Mark the underlying H2 connection for shutdown so it's not used
+                        // for new streams in case it is hung.
+                        client_session.conn.mark_shutdown();
+                    }
                 }
                 (false, Some(e))
             }
@@ -257,15 +364,15 @@ where
 
     pub(crate) async fn proxy_to_h2_upstream(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         client_session: &mut Http2Session,
         reused: bool,
         peer: &HttpPeer,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> (bool, Option<Box<Error>>)
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         #[cfg(windows)]
         let raw = client_session.fd() as std::os::windows::io::RawSocket;
@@ -296,8 +403,8 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn process_upstream_tasks_h2(
         &self,
-        session: &mut Session,
-        ctx: &mut SV::CTX,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         initial_task: HttpTask,
         rx: &mut mpsc::Receiver<HttpTask>,
         serve_from_cache: &mut ServeFromCache,
@@ -305,8 +412,8 @@ where
         response_state: &mut ResponseStateMachine,
     ) -> Result<Option<bool>>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         if serve_from_cache.should_discard_upstream() {
             // Serving the cached response and discarding the upstream one; nothing
@@ -382,10 +489,10 @@ where
     #[allow(clippy::too_many_arguments)]
     async fn bidirection_down_to_up(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         client_body: &mut h2::SendStream<bytes::Bytes>,
         mut rx: mpsc::Receiver<HttpTask>,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         write_timeout: Option<Duration>,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
         downstream_custom_message_reader: &mut Option<
@@ -394,8 +501,8 @@ where
         pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // setup custom message forwarding, if downstream supports it
         let (
@@ -504,6 +611,35 @@ where
                     match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
                         Ok(request_done) =>  {
                             downstream_state.maybe_finished(request_done);
+                        },
+                        Err(e) if e.esource == ErrorSource::Downstream => {
+                            // Downstream reset/errored while the upstream write was blocked
+                            // (e.g. on upstream flow control). Same policy as the read error
+                            // handling above: ignore the downstream error if the upstream
+                            // response is being admitted to cache, otherwise fail so the
+                            // downstream stream handles are dropped promptly.
+                            let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
+                                || serve_from_cache.is_miss();
+                            if !wait_for_cache_fill {
+                                return Err(e);
+                            }
+                            // ignore downstream error so that upstream can continue to write cache
+                            downstream_state.to_errored();
+                            if !self.inner.suppress_proxy_warn_log(
+                                session,
+                                ctx,
+                                &e,
+                                ProxyWarnLogContext::DownstreamCache,
+                            ) {
+                                warn!(
+                                    "Downstream Error ignored during caching: {}, {}",
+                                    e,
+                                    self.inner.request_summary(session, ctx)
+                                );
+                            }
+                            // This will not be treated as a final error, but we should signal to
+                            // downstream session anyway.
+                            session.downstream_session.on_proxy_failure(e);
                         },
                         Err(e) => {
                             // mark request done, attempt to drain receive
@@ -743,16 +879,16 @@ where
 
     async fn h2_response_filter(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         mut task: HttpTask,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut RangeBodyFilter,
         from_cache: bool, // are the task from cache already
     ) -> Result<HttpTask>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         if !from_cache {
             if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
@@ -843,7 +979,8 @@ where
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
-                    .response_body_filter(session, &mut data, eos, ctx)?
+                    .response_body_filter(session, &mut data, eos, ctx)
+                    .await?
                 {
                     trace!("delaying downstream response for {duration:?}");
                     time::sleep(duration).await;
@@ -904,16 +1041,16 @@ where
 
     async fn send_body_to2(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         mut data: Option<Bytes>,
         end_of_body: bool,
         client_body: &mut h2::SendStream<bytes::Bytes>,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         write_timeout: Option<Duration>,
     ) -> Result<bool>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         session
             .downstream_modules_ctx
@@ -931,15 +1068,42 @@ where
             return Ok(false);
         }
 
-        if let Some(data) = data {
-            debug!("Write {} bytes body to h2 upstream", data.len());
-            write_body(client_body, data, end_of_body, write_timeout)
-                .await
-                .map_err(|e| e.into_up())?;
+        let (data, end) = match data {
+            Some(data) => {
+                debug!("Write {} bytes body to h2 upstream", data.len());
+                (data, end_of_body)
+            }
+            None => {
+                debug!("Read downstream body done");
+                /* send a standalone END_STREAM flag */
+                (Bytes::new(), true)
+            }
+        };
+
+        /* For H2 downstreams, race the upstream write against downstream stream
+         * closure. A write blocked on upstream flow control would otherwise keep the
+         * downstream stream handles referenced while a downstream RST_STREAM goes
+         * unobserved, pinning the downstream connection window credit until the
+         * write completes. */
+        if let Some(stream_close) = session.downstream_session.watch_h2_stream_close() {
+            tokio::select! {
+                biased;
+                res = write_body(client_body, data, end, write_timeout) => {
+                    res.map_err(|e| e.into_up())?;
+                }
+                close_result = stream_close => {
+                    return match close_result {
+                        Ok(reason) => Error::e_explain(
+                            H2Error,
+                            format!("downstream H2 stream closed (reason: {reason}) while writing body to upstream"),
+                        ),
+                        Err(e) => Err(e),
+                    }
+                    .map_err(|e| e.into_down());
+                }
+            }
         } else {
-            debug!("Read downstream body done");
-            /* send a standalone END_STREAM flag */
-            write_body(client_body, Bytes::new(), true, write_timeout)
+            write_body(client_body, data, end, write_timeout)
                 .await
                 .map_err(|e| e.into_up())?;
         }
@@ -1120,26 +1284,110 @@ pub(crate) async fn pipe_up_to_down_response(
 }
 
 #[test]
-fn test_update_authority() {
-    let mut parts = http::request::Builder::new()
+fn test_update_h2_scheme_authority() {
+    fn update(header: &mut RequestHeader, raw_host: &[u8], tls: bool) -> Result<()> {
+        let path_and_query = h2_path_and_query(header)?;
+        update_h2_scheme_authority(header, raw_host, tls, path_and_query)
+    }
+
+    let parts = http::request::Builder::new()
         .body(())
         .unwrap()
         .into_parts()
         .0;
-    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
-    assert_eq!("example.com", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:456", true).unwrap();
-    assert_eq!("example.com:456", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:", true).unwrap();
-    assert_eq!("example.com:", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:123:345", true).unwrap();
-    assert_eq!("example.com:123", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"[::1]", true).unwrap();
-    assert_eq!("[::1]", parts.uri.authority().unwrap());
+    let mut header = RequestHeader::from(parts);
+    update(&mut header, b"example.com", true).unwrap();
+    assert_eq!("example.com", header.uri.authority().unwrap());
+    let err = update(&mut header, b"user@example.com", true).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    update(&mut header, b"example.com:456", true).unwrap();
+    assert_eq!("example.com:456", header.uri.authority().unwrap());
+    update(&mut header, b"example.com:", true).unwrap();
+    assert_eq!("example.com:", header.uri.authority().unwrap());
+    let err = update(&mut header, b"example.com:123:345", true).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    update(&mut header, b"[::1]", true).unwrap();
+    assert_eq!("[::1]", header.uri.authority().unwrap());
 
     // verify scheme
-    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
-    assert_eq!("https://example.com", parts.uri);
-    update_h2_scheme_authority(&mut parts, b"example.com", false).unwrap();
-    assert_eq!("http://example.com", parts.uri);
+    update(&mut header, b"example.com", true).unwrap();
+    assert_eq!("https://example.com", header.uri);
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!("http://example.com", header.uri);
+
+    // H1 absolute-form is decomposed into H2 pseudo-header components.
+    let mut header = RequestHeader::build("GET", b"http://example.com/path?q=1", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(header.uri.path_and_query().unwrap().as_str(), "/path?q=1");
+
+    let mut header = RequestHeader::build(
+        "GET",
+        b"http://example.com/caf%C3%A9?q=r%C3%A9sum%C3%A9",
+        None,
+    )
+    .unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(
+        header.uri.path_and_query().unwrap().as_str(),
+        "/caf%C3%A9?q=r%C3%A9sum%C3%A9"
+    );
+
+    let mut header = RequestHeader::build("GET", b"http://example.com?only=query", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(
+        header.uri.path_and_query().unwrap().as_str(),
+        "/?only=query"
+    );
+
+    let mut header = RequestHeader::build("GET", b"http://example.com", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(header.uri.path_and_query().unwrap().as_str(), "/");
+
+    // Origin-form remains unchanged.
+    let mut header = RequestHeader::build("GET", b"/path?q=1", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(header.uri.path_and_query().unwrap().as_str(), "/path?q=1");
+
+    let mut header = RequestHeader::build("GET", b"http:/\\/\\other.example/admin", None).unwrap();
+    let err = update(&mut header, b"example.com", false).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    assert_eq!(
+        err.context.as_ref().map(|context| context.as_str()),
+        Some("ambiguous HTTP absolute-form request target")
+    );
+
+    let raw_target = b"http://example.com/\xff";
+    let mut header = RequestHeader::build("GET", raw_target, None).unwrap();
+    let err = update(&mut header, b"example.com", false).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    assert_eq!(
+        err.context.as_ref().map(|context| context.as_str()),
+        Some("non-UTF-8 request target cannot be forwarded over HTTP/2")
+    );
+    assert_eq!(header.raw_path(), raw_target);
+}
+
+#[test]
+fn test_h2_path_is_rooted_for_targets_with_no_authority() {
+    // Targets with no absolute-form authority carry no absolute path, so :path is rooted
+    // rather than forwarding bytes that are invalid there (RFC 9113 section 8.3.1).
+    // Forwarding them would also concatenate against the authority, rendering as
+    // "http://example.comfoo/bar".
+    for target in [&b"foo/bar"[..], b"myproto:opaque", b"foo?q=1"] {
+        let mut header = RequestHeader::build("GET", target, None).unwrap();
+        let label = String::from_utf8_lossy(target);
+        // The H1 wire serializes these bytes; only the H2 rewrite below discards them.
+        assert_eq!(target, header.raw_path(), "{label}");
+
+        let path_and_query = h2_path_and_query(&header).unwrap();
+        assert_eq!("/", path_and_query.as_str(), "{label}");
+
+        update_h2_scheme_authority(&mut header, b"example.com", false, path_and_query).unwrap();
+        assert_eq!("http://example.com/", header.uri.to_string(), "{label}");
+        assert_eq!(
+            Some("example.com"),
+            header.uri.authority().map(|authority| authority.as_str()),
+            "{label}"
+        );
+    }
 }

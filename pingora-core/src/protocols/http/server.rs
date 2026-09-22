@@ -18,7 +18,7 @@ use super::custom::server::Session as SessionCustom;
 use super::error_resp;
 use super::subrequest::server::HttpSession as SessionSubrequest;
 use super::v1::server::HttpSession as SessionV1;
-use super::v2::server::HttpSession as SessionV2;
+use super::v2::server::{HttpSession as SessionV2, Idle};
 use super::HttpTask;
 use crate::custom_session;
 use crate::protocols::{Digest, SocketAddr, Stream};
@@ -53,31 +53,57 @@ impl ReusableHttpStream {
 }
 
 /// HTTP server session object for both HTTP/1.x and HTTP/2
-pub enum Session {
+pub enum Session<CS = ()>
+where
+    CS: SessionCustom,
+{
     H1(SessionV1),
     H2(SessionV2),
     Subrequest(SessionSubrequest),
-    Custom(Box<dyn SessionCustom>),
+    Custom(CS),
 }
 
-impl Session {
+impl Session<()> {
     /// Create a new [`Session`] from an established connection for HTTP/1.x
     pub fn new_http1(stream: Stream) -> Self {
-        Self::H1(SessionV1::new(stream))
+        Self::new_http1_with_custom_session(stream)
     }
 
     /// Create a new [`Session`] from an established HTTP/2 stream
     pub fn new_http2(session: SessionV2) -> Self {
-        Self::H2(session)
+        Self::new_http2_with_custom_session(session)
     }
 
     /// Create a new [`Session`] from a subrequest session
     pub fn new_subrequest(session: SessionSubrequest) -> Self {
+        Self::new_subrequest_with_custom_session(session)
+    }
+}
+
+impl<CS> Session<CS>
+where
+    CS: SessionCustom,
+{
+    /// Create a new [`Session`] with a concrete custom-session type from an
+    /// established connection for HTTP/1.x.
+    pub fn new_http1_with_custom_session(stream: Stream) -> Self {
+        Self::H1(SessionV1::new(stream))
+    }
+
+    /// Create a new [`Session`] with a concrete custom-session type from an
+    /// established HTTP/2 stream.
+    pub fn new_http2_with_custom_session(session: SessionV2) -> Self {
+        Self::H2(session)
+    }
+
+    /// Create a new [`Session`] with a concrete custom-session type from a
+    /// subrequest session.
+    pub fn new_subrequest_with_custom_session(session: SessionSubrequest) -> Self {
         Self::Subrequest(session)
     }
 
     /// Create a new [`Session`] from a custom session
-    pub fn new_custom(session: Box<dyn SessionCustom>) -> Self {
+    pub fn new_custom(session: CS) -> Self {
         Self::Custom(session)
     }
 
@@ -530,6 +556,10 @@ impl Session {
     }
 
     /// Give up the http session abruptly.
+    ///
+    /// This is a failure path: the response is abandoned mid-message, so each
+    /// protocol signals it in whatever way lets the peer tell this apart from a
+    /// response that was completed.
     /// For H1 this will close the underlying connection
     /// For H2 this will send RESET frame to end this stream without impacting the connection
     /// For subrequests, this will drop task senders and receivers.
@@ -538,7 +568,7 @@ impl Session {
             Self::H1(s) => s.shutdown().await,
             Self::H2(s) => s.shutdown(),
             Self::Subrequest(s) => s.shutdown(),
-            Self::Custom(s) => s.shutdown(0, "shutdown").await,
+            Self::Custom(s) => s.abandon("shutdown").await,
         }
     }
 
@@ -709,6 +739,19 @@ impl Session {
         }
     }
 
+    /// Return an [`Idle`] future that waits for this H2 stream to close without
+    /// reading any body data.
+    ///
+    /// For HTTP/2 this resolves when the client resets the stream (`RST_STREAM`),
+    /// cleanly closes the stream, or the stream errors. Other protocols have no
+    /// out-of-band close signal, so this returns `None` for them.
+    pub fn watch_h2_stream_close(&mut self) -> Option<Idle<'_>> {
+        match self {
+            Self::H2(s) => Some(s.idle()),
+            _ => None,
+        }
+    }
+
     pub fn as_http1(&self) -> Option<&SessionV1> {
         match self {
             Self::H1(s) => Some(s),
@@ -745,16 +788,16 @@ impl Session {
         }
     }
 
-    pub fn as_custom(&self) -> Option<&dyn SessionCustom> {
+    pub fn as_custom(&self) -> Option<&CS> {
         match self {
             Self::H1(_) => None,
             Self::H2(_) => None,
             Self::Subrequest(_) => None,
-            Self::Custom(c) => Some(c.as_ref()),
+            Self::Custom(c) => Some(c),
         }
     }
 
-    pub fn as_custom_mut(&mut self) -> Option<&mut Box<dyn SessionCustom>> {
+    pub fn as_custom_mut(&mut self) -> Option<&mut CS> {
         match self {
             Self::H1(_) => None,
             Self::H2(_) => None,
@@ -1005,13 +1048,13 @@ impl Session {
 mod tests {
     use super::*;
     use crate::protocols::http::custom::CustomMessageWrite;
-    use async_trait::async_trait;
     use futures::Stream;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::{Arc, Mutex};
 
     #[tokio::test]
     async fn custom_proxy_task_defaults_are_opted_out_and_fail_loudly() {
-        let mut session = Session::new_custom(Box::new(()));
+        let mut session = Session::new_custom(());
 
         assert!(!session.supports_proxy_task_api());
         session.set_proxy_tasks_enabled(true);
@@ -1029,7 +1072,7 @@ mod tests {
 
     #[tokio::test]
     async fn custom_proxy_task_methods_delegate_to_the_custom_session() {
-        let mut session = Session::new_custom(Box::new(ProxyTaskCustom::new()));
+        let mut session = Session::new_custom(ProxyTaskCustom::new());
 
         assert!(!session.supports_proxy_task_api());
         session.set_proxy_tasks_enabled(true);
@@ -1041,10 +1084,27 @@ mod tests {
         assert!(!session.has_pending_downstream_proxy_tasks());
     }
 
+    /// `Session::shutdown` abandons a response mid-message, so it must take the
+    /// entry point that lets a custom protocol convey exactly that. Routing it to
+    /// the bare `shutdown` instead leaves the protocol with no way to distinguish
+    /// an abandoned response from a completed one, which a peer can then read as
+    /// success.
+    #[tokio::test]
+    async fn custom_session_shutdown_signals_an_incomplete_message() {
+        let shutdown_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut session =
+            Session::new_custom(ProxyTaskCustom::with_shutdown_calls(shutdown_calls.clone()));
+
+        session.shutdown().await;
+
+        assert_eq!(*shutdown_calls.lock().unwrap(), ["abandon(shutdown)"]);
+    }
+
     struct ProxyTaskCustom {
         header: RequestHeader,
         enabled: bool,
         tasks: Vec<HttpTask>,
+        shutdown_calls: Arc<Mutex<Vec<String>>>,
     }
 
     impl ProxyTaskCustom {
@@ -1053,11 +1113,18 @@ mod tests {
                 header: RequestHeader::build("GET", b"/", None).unwrap(),
                 enabled: false,
                 tasks: Vec::new(),
+                shutdown_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_shutdown_calls(shutdown_calls: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                shutdown_calls,
+                ..Self::new()
             }
         }
     }
 
-    #[async_trait]
     impl SessionCustom for ProxyTaskCustom {
         fn req_header(&self) -> &RequestHeader {
             &self.header
@@ -1156,8 +1223,18 @@ mod tests {
             unreachable!("not used by proxy task dispatch test")
         }
 
-        async fn shutdown(&mut self, _code: u32, _ctx: &str) {
-            unreachable!("not used by proxy task dispatch test")
+        async fn shutdown(&mut self, code: u32, ctx: &str) {
+            self.shutdown_calls
+                .lock()
+                .unwrap()
+                .push(format!("shutdown({code}, {ctx})"));
+        }
+
+        async fn abandon(&mut self, ctx: &str) {
+            self.shutdown_calls
+                .lock()
+                .unwrap()
+                .push(format!("abandon({ctx})"));
         }
 
         fn is_body_done(&mut self) -> bool {
