@@ -3098,6 +3098,30 @@ mod tests_stream {
         );
     }
 
+    /// The same comparison, on the two spellings that name the same host.
+    ///
+    /// `:8080` above is not a default port, so that rejection stands; these
+    /// differ only by case or by writing the scheme's own default, which the
+    /// origin cannot tell apart.
+    #[tokio::test]
+    async fn read_absolute_form_request_target_accepts_the_same_host_respelled() {
+        init_log();
+        for input in [
+            b"GET http://pingora.org:80/a HTTP/1.1\r\nHost: pingora.org\r\n\r\n".as_slice(),
+            b"GET http://pingora.org/a HTTP/1.1\r\nHost: pingora.org:80\r\n\r\n".as_slice(),
+            b"GET http://PINGORA.ORG/a HTTP/1.1\r\nHost: pingora.org\r\n\r\n".as_slice(),
+        ] {
+            let mock_io = Builder::new().read(input).build();
+            let mut http_stream = HttpSession::new(Box::new(mock_io));
+            http_stream.read_request().await.unwrap_or_else(|e| {
+                panic!(
+                    "{} should be accepted: {e}",
+                    String::from_utf8_lossy(input).lines().next().unwrap()
+                )
+            });
+        }
+    }
+
     #[tokio::test]
     async fn read_authority_form_request_target() {
         init_log();

@@ -891,6 +891,16 @@ async fn test_h1_ambiguous_authority_never_reaches_upstream() {
             "\"@\" in a fragment-like target",
             "GET /test#user@evil.example HTTP/1.1\r\nx-port: {port}\r\nHost: authority.example\r\n\r\n",
         ),
+        // A Host that names the same host as an absolute-form target, spelled
+        // differently: the origin cannot tell these apart, so neither do we.
+        (
+            "absolute form, Host differing in case",
+            "GET http://authority.example/test HTTP/1.1\r\nx-port: {port}\r\nHost: AUTHORITY.EXAMPLE\r\n\r\n",
+        ),
+        (
+            "absolute form, Host writing the default port",
+            "GET http://authority.example/test HTTP/1.1\r\nx-port: {port}\r\nHost: authority.example:80\r\n\r\n",
+        ),
     ] {
         let (port, received) = capture_h1_upstream().await;
         let status = send_h1_raw_request(port, request).await;

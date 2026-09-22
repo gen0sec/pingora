@@ -78,7 +78,7 @@ pub fn validate_request_authority(req: &RequestHeader) -> Result<()> {
             if authority.contains(&b'@') {
                 return Error::e_explain(InvalidHTTPHeader, "userinfo in request target");
             }
-            if host.is_some_and(|host| host.as_bytes() != authority) {
+            if host.is_some_and(|host| !same_authority(host.as_bytes(), authority, Some(scheme))) {
                 return Error::e_explain(
                     InvalidHTTPHeader,
                     "Host header differs from request-target authority",
@@ -108,10 +108,10 @@ pub(super) fn validate_request_authority_fields(req: &RequestHeader) -> Result<(
         return Error::e_explain(InvalidHTTPHeader, "userinfo in URI authority");
     }
 
-    if host
-        .zip(uri_authority)
-        .is_some_and(|(host, authority)| host.as_bytes() != authority.as_bytes())
-    {
+    let scheme = req.uri.scheme_str().map(|scheme| scheme.as_bytes());
+    if host.zip(uri_authority).is_some_and(|(host, authority)| {
+        !same_authority(host.as_bytes(), authority.as_bytes(), scheme)
+    }) {
         return Error::e_explain(InvalidHTTPHeader, "Host header differs from URI authority");
     }
 
@@ -207,6 +207,104 @@ fn reconcile_connect_host(
             InvalidHTTPHeader,
             "Host header differs from CONNECT request target",
         )
+    }
+}
+
+/// Whether `host` and `target` name the same authority.
+///
+/// Byte equality, widened by exactly two equivalences that cannot make two
+/// parsers disagree about *which* host is named:
+///
+/// * the host is compared ASCII-case-insensitively, because registered names
+///   are case-insensitive (RFC 9110 §4.2.3), and
+/// * an absent port equals the scheme's default, because `http://a.example/`
+///   and `Host: a.example:80` are the same origin (RFC 9110 §4.2.1).
+///
+/// Everything else stays byte-exact, deliberately. The strictness this widens
+/// exists to stop one target being read as two different hosts — userinfo
+/// hiding a second name, multiple unbracketed colons, slash normalisation
+/// moving the authority's end — and neither case nor a default port does that.
+/// In particular a trailing dot is still a mismatch: `a.example.` is a
+/// different field value, not a different spelling.
+///
+/// Two narrower rules keep this from becoming a divergence of its own:
+///
+/// * the case-insensitive compare is skipped when either side contains `%`.
+///   Percent-encodings and IPv6 zone IDs are **not** case-insensitive, and
+///   folding them would make `%2F` equal `%2f` and `%25Eth0` equal `%25eth0`.
+/// * ports are compared as parsed numbers, never by stripping a `:443`
+///   suffix, so `a.example:0443` and `a.example:443x` stay distinct.
+///
+/// Call this only after [`has_ambiguous_port_suffix`] has rejected its input:
+/// the host/port split below assumes at most one unbracketed colon, and is not
+/// a substitute for that check.
+pub(super) fn same_authority(host: &[u8], target: &[u8], scheme: Option<&[u8]>) -> bool {
+    if host == target {
+        return true;
+    }
+
+    let (host_name, host_port) = split_host_port(host);
+    let (target_name, target_port) = split_host_port(target);
+
+    let names_match = if host_name.contains(&b'%') || target_name.contains(&b'%') {
+        host_name == target_name
+    } else {
+        host_name.eq_ignore_ascii_case(target_name)
+    };
+    if !names_match {
+        return false;
+    }
+
+    match (parse_port(host_port), parse_port(target_port)) {
+        (Some(a), Some(b)) => a == b,
+        // One side wrote the port the other left implicit.
+        (Some(port), None) | (None, Some(port)) => default_port(scheme) == Some(port),
+        (None, None) => host_port.is_none() && target_port.is_none(),
+    }
+}
+
+/// Split an authority into its host and its port bytes, keeping IPv6 brackets
+/// with the host. Assumes at most one unbracketed colon.
+fn split_host_port(authority: &[u8]) -> (&[u8], Option<&[u8]>) {
+    let after_brackets = match authority.iter().rposition(|&b| b == b']') {
+        Some(end) => end + 1,
+        None => 0,
+    };
+    match authority[after_brackets..].iter().position(|&b| b == b':') {
+        Some(offset) => {
+            let colon = after_brackets + offset;
+            (&authority[..colon], Some(&authority[colon + 1..]))
+        }
+        None => (authority, None),
+    }
+}
+
+/// A port as a number, or `None` when it is absent or not written plainly.
+///
+/// Numeric rather than textual, so `443x` cannot read as 443. Leading zeros
+/// are refused rather than folded: `0443` is numerically 443, but a peer that
+/// rejects it while this accepted it is the disagreement this module exists
+/// to prevent, so the odd spelling simply does not get the equivalence.
+fn parse_port(port: Option<&[u8]>) -> Option<u16> {
+    let port = port?;
+    if port.is_empty() || port.iter().any(|b| !b.is_ascii_digit()) {
+        return None;
+    }
+    if port.len() > 1 && port[0] == b'0' {
+        return None;
+    }
+    std::str::from_utf8(port).ok()?.parse().ok()
+}
+
+/// The port a scheme implies when the authority leaves it out.
+fn default_port(scheme: Option<&[u8]>) -> Option<u16> {
+    let scheme = scheme?;
+    if scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"ws") {
+        Some(80)
+    } else if scheme.eq_ignore_ascii_case(b"https") || scheme.eq_ignore_ascii_case(b"wss") {
+        Some(443)
+    } else {
+        None
     }
 }
 
@@ -309,6 +407,74 @@ mod tests {
     }
 
     #[test]
+    fn same_authority_widens_only_case_and_the_default_port() {
+        // The two equivalences.
+        assert!(same_authority(b"A.Example", b"a.example", Some(b"http")));
+        assert!(same_authority(b"a.example:80", b"a.example", Some(b"http")));
+        assert!(same_authority(b"a.example", b"a.example:80", Some(b"http")));
+        assert!(same_authority(
+            b"a.example:443",
+            b"a.example",
+            Some(b"https")
+        ));
+        assert!(same_authority(b"a.example", b"a.example:443", Some(b"wss")));
+
+        // Different host, different port, or the wrong scheme's default.
+        assert!(!same_authority(b"b.example", b"a.example", Some(b"http")));
+        assert!(!same_authority(
+            b"a.example:8080",
+            b"a.example",
+            Some(b"http")
+        ));
+        assert!(!same_authority(
+            b"a.example:443",
+            b"a.example",
+            Some(b"http")
+        ));
+        assert!(!same_authority(
+            b"a.example:80",
+            b"a.example",
+            Some(b"https")
+        ));
+
+        // A trailing dot is a different field value, not a spelling.
+        assert!(!same_authority(b"a.example.", b"a.example", Some(b"http")));
+
+        // Ports are numbers, not a `:443` suffix to strip.
+        assert!(!same_authority(
+            b"a.example:0443",
+            b"a.example",
+            Some(b"https")
+        ));
+        assert!(!same_authority(
+            b"a.example:443x",
+            b"a.example",
+            Some(b"https")
+        ));
+        assert!(!same_authority(b"a.example:", b"a.example", Some(b"https")));
+
+        // Percent-encodings and IPv6 zone IDs are case-sensitive.
+        assert!(!same_authority(
+            b"[fe80::1%25Eth0]",
+            b"[fe80::1%25eth0]",
+            Some(b"http")
+        ));
+        assert!(same_authority(
+            b"[fe80::1%25eth0]",
+            b"[fe80::1%25eth0]",
+            Some(b"http")
+        ));
+
+        // IPv6 keeps its brackets with the host, and its port is still a port.
+        assert!(same_authority(b"[::1]:443", b"[::1]", Some(b"https")));
+        assert!(!same_authority(b"[::1]:8443", b"[::1]", Some(b"https")));
+
+        // Without a scheme there is no default to imply.
+        assert!(!same_authority(b"a.example:443", b"a.example", None));
+        assert!(same_authority(b"A.Example", b"a.example", None));
+    }
+
+    #[test]
     fn validate_absolute_form() {
         assert!(validate_request_authority(&request(
             "GET",
@@ -402,6 +568,46 @@ mod tests {
             &["authority.example"]
         ))
         .is_ok());
+    }
+
+    #[test]
+    fn absolute_form_host_may_differ_in_case_or_default_port() {
+        for (target, host) in [
+            ("http://authority.example/test", "AUTHORITY.EXAMPLE"),
+            ("http://AUTHORITY.EXAMPLE/test", "authority.example"),
+            ("http://authority.example/test", "authority.example:80"),
+            ("http://authority.example:80/test", "authority.example"),
+            ("https://authority.example/test", "authority.example:443"),
+            ("ws://authority.example/test", "authority.example:80"),
+        ] {
+            let req = request("GET", target, &[host]);
+            assert!(
+                validate_request_authority(&req).is_ok(),
+                "{target} with Host: {host} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_form_host_must_still_name_the_same_origin() {
+        for (target, host) in [
+            // A different host.
+            ("http://authority.example/test", "other.example"),
+            // A trailing dot is a different field value.
+            ("http://authority.example/test", "authority.example."),
+            // Not the scheme's default port.
+            ("http://authority.example/test", "authority.example:443"),
+            ("https://authority.example/test", "authority.example:80"),
+            ("http://authority.example:8080/test", "authority.example"),
+            // A port that is not a plain number.
+            ("https://authority.example/test", "authority.example:0443"),
+        ] {
+            let req = request("GET", target, &[host]);
+            assert!(
+                validate_request_authority(&req).is_err(),
+                "{target} with Host: {host} should be rejected"
+            );
+        }
     }
 
     #[test]

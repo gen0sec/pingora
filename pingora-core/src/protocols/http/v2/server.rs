@@ -1069,11 +1069,17 @@ mod test {
         assert!(invalid_request_authority(&authority_request(&[
             "other.example"
         ])));
-        assert!(invalid_request_authority(&authority_request(&[
+        // Case and an explicit default port name the same host, so they are
+        // accepted; everything else about the comparison stays byte-exact.
+        assert!(!invalid_request_authority(&authority_request(&[
             "AUTHORITY.EXAMPLE"
         ])));
-        assert!(invalid_request_authority(&authority_request(&[
+        assert!(!invalid_request_authority(&authority_request(&[
             "authority.example:443"
+        ])));
+        // ...but only the scheme's own default. `:authority` here is https.
+        assert!(invalid_request_authority(&authority_request(&[
+            "authority.example:80"
         ])));
         assert!(invalid_request_authority(&authority_request(&[
             "authority.example",
@@ -1094,8 +1100,13 @@ mod test {
             "https://authority.example:443/test",
             &["other.example"]
         )));
-        assert!(invalid_request_authority(&request(
+        assert!(!invalid_request_authority(&request(
             "https://authority.example:443/test",
+            &["authority.example"]
+        )));
+        // A non-default port is still a different origin.
+        assert!(invalid_request_authority(&request(
+            "https://authority.example:8443/test",
             &["authority.example"]
         )));
         assert!(!invalid_request_authority(&request(
