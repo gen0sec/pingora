@@ -40,9 +40,20 @@ pub use pingora_http::authority::{
 /// [RFC 9112 section 3.2.2], which replaces conflicting `Host`. Userinfo is unsafe because
 /// [`http::Uri::host`] strips it.
 ///
-/// Authority bytes otherwise remain opaque. HTTP/1 ingress and standard proxy egress call this;
+/// Comparing `Host` against a request target allows exactly two respellings of
+/// one origin: ASCII case in the host ([RFC 9110 section 4.2.3]) and a port
+/// written out that matches the scheme's default ([RFC 9110 section 4.2.1]).
+/// A caller must therefore not assume the two are byte-identical after this
+/// returns — notably when deriving a cache key or a routing decision from one
+/// of them. Authority bytes are otherwise opaque: no other normalization is
+/// applied, and a port that is not a plain number, or a value carrying more
+/// than one unbracketed colon, is never equal to anything.
+///
+/// HTTP/1 ingress and standard proxy egress call this;
 /// HTTP/2 performs equivalent stream-local checks.
 ///
+/// [RFC 9110 section 4.2.1]: https://www.rfc-editor.org/rfc/rfc9110.html#section-4.2.1
+/// [RFC 9110 section 4.2.3]: https://www.rfc-editor.org/rfc/rfc9110.html#section-4.2.3
 /// [RFC 9110 section 4.2.4]: https://www.rfc-editor.org/rfc/rfc9110.html#section-4.2.4
 /// [RFC 9112 section 3.2]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2
 /// [RFC 9112 section 3.2.2]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2.2
@@ -235,12 +246,22 @@ fn reconcile_connect_host(
 /// * ports are compared as parsed numbers, never by stripping a `:443`
 ///   suffix, so `a.example:0443` and `a.example:443x` stay distinct.
 ///
-/// Call this only after [`has_ambiguous_port_suffix`] has rejected its input:
-/// the host/port split below assumes at most one unbracketed colon, and is not
-/// a substitute for that check.
+/// The host/port split assumes at most one unbracketed colon, so this checks
+/// [`has_ambiguous_port_suffix`] on the `Host` itself — that header reaches
+/// here unparsed, and a multi-colon spelling is the module's own definition
+/// of a value two parsers will read differently.
 pub(super) fn same_authority(host: &[u8], target: &[u8], scheme: Option<&[u8]>) -> bool {
     if host == target {
         return true;
+    }
+
+    // The precondition this relies on, enforced rather than assumed. The
+    // target has been through `has_ambiguous_port_suffix` (CONNECT) or
+    // `Authority::try_from` (absolute form), but a `Host` header is parsed
+    // nowhere else, and the split below reads only the first unbracketed
+    // colon — where another parser may read the last.
+    if has_ambiguous_port_suffix(host) {
+        return false;
     }
 
     let (host_name, host_port) = split_host_port(host);
@@ -255,12 +276,29 @@ pub(super) fn same_authority(host: &[u8], target: &[u8], scheme: Option<&[u8]>) 
         return false;
     }
 
-    match (parse_port(host_port), parse_port(target_port)) {
-        (Some(a), Some(b)) => a == b,
+    match (port_of(host_port), port_of(target_port)) {
+        // A port neither side can agree how to read is not an equivalence.
+        // Folding it into "absent" would have matched it against the
+        // scheme's default, which is how `a.example:` and
+        // `a.example:8080:443` came to equal `a.example:80` and
+        // `a.example:443`.
+        (Port::Malformed, _) | (_, Port::Malformed) => false,
+        (Port::Number(a), Port::Number(b)) => a == b,
         // One side wrote the port the other left implicit.
-        (Some(port), None) | (None, Some(port)) => default_port(scheme) == Some(port),
-        (None, None) => host_port.is_none() && target_port.is_none(),
+        (Port::Number(port), Port::Absent) | (Port::Absent, Port::Number(port)) => {
+            default_port(scheme) == Some(port)
+        }
+        (Port::Absent, Port::Absent) => true,
     }
+}
+
+/// A port as this module is willing to read it.
+enum Port {
+    Absent,
+    Number(u16),
+    /// Written, but not as a plain number this and every other parser would
+    /// read the same way. Never equal to anything, including itself.
+    Malformed,
 }
 
 /// Split an authority into its host and its port bytes, keeping IPv6 brackets
@@ -279,21 +317,28 @@ fn split_host_port(authority: &[u8]) -> (&[u8], Option<&[u8]>) {
     }
 }
 
-/// A port as a number, or `None` when it is absent or not written plainly.
+/// Classify an authority's port bytes.
 ///
-/// Numeric rather than textual, so `443x` cannot read as 443. Leading zeros
-/// are refused rather than folded: `0443` is numerically 443, but a peer that
-/// rejects it while this accepted it is the disagreement this module exists
-/// to prevent, so the odd spelling simply does not get the equivalence.
-fn parse_port(port: Option<&[u8]>) -> Option<u16> {
-    let port = port?;
+/// Absent and malformed are kept apart deliberately: only an *absent* port
+/// can stand in for the scheme's default. Numeric rather than textual, so
+/// `443x` cannot read as 443, and a leading zero is refused rather than
+/// folded — `0443` is numerically 443, but a peer that rejects it while this
+/// accepted it is the disagreement this module exists to prevent.
+fn port_of(port: Option<&[u8]>) -> Port {
+    let Some(port) = port else {
+        return Port::Absent;
+    };
     if port.is_empty() || port.iter().any(|b| !b.is_ascii_digit()) {
-        return None;
+        return Port::Malformed;
     }
     if port.len() > 1 && port[0] == b'0' {
-        return None;
+        return Port::Malformed;
     }
-    std::str::from_utf8(port).ok()?.parse().ok()
+    match std::str::from_utf8(port).ok().and_then(|p| p.parse().ok()) {
+        Some(number) => Port::Number(number),
+        // Out of range for a port.
+        None => Port::Malformed,
+    }
 }
 
 /// The port a scheme implies when the authority leaves it out.
@@ -440,6 +485,33 @@ mod tests {
         // A trailing dot is a different field value, not a spelling.
         assert!(!same_authority(b"a.example.", b"a.example", Some(b"http")));
 
+        // A malformed port is not an absent one. Each of these is paired
+        // with a target that *carries* the default port explicitly, which
+        // is the only shape that reaches the mixed arm — pinning them
+        // against a portless target instead passes whether or not the
+        // distinction exists.
+        for bad in [
+            &b"a.example:"[..],
+            b"a.example:443x",
+            b"a.example:0443",
+            b"a.example:65536",
+            b"a.example:+443",
+            // Multiple unbracketed colons: read as port `8080:443` here and
+            // as `8080` by a parser that takes the last colon.
+            b"a.example:8080:443",
+        ] {
+            assert!(
+                !same_authority(bad, b"a.example:443", Some(b"https")),
+                "{} should not equal a.example:443",
+                String::from_utf8_lossy(bad)
+            );
+            assert!(
+                !same_authority(bad, b"a.example", Some(b"https")),
+                "{} should not equal a.example",
+                String::from_utf8_lossy(bad)
+            );
+        }
+
         // Ports are numbers, not a `:443` suffix to strip.
         assert!(!same_authority(
             b"a.example:0443",
@@ -464,6 +536,11 @@ mod tests {
             b"[fe80::1%25eth0]",
             Some(b"http")
         ));
+
+        // Nested brackets are ambiguous in their own right, and the port
+        // here parses cleanly — so `has_ambiguous_port_suffix` is the only
+        // thing rejecting this, not the port classification.
+        assert!(!same_authority(b"[a[b]:80", b"[A[B]:80", Some(b"http")));
 
         // IPv6 keeps its brackets with the host, and its port is still a port.
         assert!(same_authority(b"[::1]:443", b"[::1]", Some(b"https")));
@@ -599,8 +676,21 @@ mod tests {
             ("http://authority.example/test", "authority.example:443"),
             ("https://authority.example/test", "authority.example:80"),
             ("http://authority.example:8080/test", "authority.example"),
-            // A port that is not a plain number.
+            // A port that is not a plain number, against a target that
+            // carries the default port explicitly as well as one that
+            // leaves it implicit.
             ("https://authority.example/test", "authority.example:0443"),
+            (
+                "https://authority.example:443/test",
+                "authority.example:0443",
+            ),
+            ("http://authority.example:80/test", "authority.example:"),
+            ("http://authority.example:80/test", "authority.example:80x"),
+            // Two unbracketed colons is a value two parsers read differently.
+            (
+                "https://authority.example:443/test",
+                "authority.example:8080:443",
+            ),
         ] {
             let req = request("GET", target, &[host]);
             assert!(
