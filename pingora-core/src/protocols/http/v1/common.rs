@@ -207,6 +207,17 @@ pub fn is_upgrade_resp(header: &ResponseHeader) -> bool {
     header.status == 101 && header.version == http::Version::HTTP_11
 }
 
+/// Whether `header`, sent in response to a request with `method`, turns the connection into a
+/// tunnel.
+///
+/// Any 2xx response to CONNECT does so: the connection stops carrying HTTP right after the
+/// response header, and the response has no content
+/// (<https://www.rfc-editor.org/rfc/rfc9110#section-9.3.6>,
+/// <https://www.rfc-editor.org/rfc/rfc9112#section-6.3-2.2>).
+pub fn is_connect_tunnel_resp(method: &http::Method, header: &ResponseHeader) -> bool {
+    method == http::Method::CONNECT && header.status.is_success()
+}
+
 #[inline]
 pub fn header_value_content_length(
     header_value: Option<&http::header::HeaderValue>,

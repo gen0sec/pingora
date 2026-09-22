@@ -115,6 +115,7 @@ where
         }
 
         session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
+        session.set_upstream_connect_request(req.method == http::Method::CONNECT);
 
         session.upstream_compression.request_filter(&req);
 
@@ -937,8 +938,11 @@ where
                 /* Convert HTTP 1.0 style response to chunked encoding so that we don't
                  * have to close the downstream connection */
                 // these status codes / method cannot have body, so no need to add chunked encoding
+                // a 2xx to CONNECT has no body either: the connection becomes a tunnel
                 let no_body = session.req_header().method == http::method::Method::HEAD
-                    || matches!(header.status.as_u16(), 204 | 304);
+                    || matches!(header.status.as_u16(), 204 | 304)
+                    || (session.req_header().method == http::method::Method::CONNECT
+                        && header.status.is_success());
                 if !no_body
                     && !header.status.is_informational()
                     && header

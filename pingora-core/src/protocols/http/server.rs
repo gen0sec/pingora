@@ -840,11 +840,12 @@ where
     ///
     /// Returns `Some(true)` when an upgrade request gets an upgrade response,
     /// `Some(false)` when an upgrade request gets a non-upgrade response, and
-    /// `None` when this request is not an upgrade.
+    /// `None` when this request is not an upgrade. A CONNECT request counts as an upgrade
+    /// request, and any 2xx response to it as the upgrade response.
     pub fn is_upgrade(&self, header: &ResponseHeader) -> Option<bool> {
         match self {
             Self::H1(s) => s.is_upgrade(header),
-            Self::H2(_) => None,
+            Self::H2(s) => s.is_upgrade(header),
             Self::Subrequest(s) => s.is_upgrade(header),
             Self::Custom(s) => {
                 if s.is_upgrade_req() {
@@ -856,11 +857,12 @@ where
         }
     }
 
-    /// Whether this session was fully upgraded (completed Upgrade handshake).
+    /// Whether this session was fully upgraded (completed Upgrade handshake, or a 2xx response
+    /// turned a CONNECT into a tunnel).
     pub fn was_upgraded(&self) -> bool {
         match self {
             Self::H1(s) => s.was_upgraded(),
-            Self::H2(_) => false,
+            Self::H2(s) => s.was_upgraded(),
             Self::Subrequest(s) => s.was_upgraded(),
             Self::Custom(s) => s.was_upgraded(),
         }

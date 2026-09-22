@@ -595,6 +595,8 @@ where
     pub upstream_headers_mutated_for_cache: bool,
     /// Upstream predicate for whether this HTTP/1 request is an upgrade.
     h1_upgrade_request_status: H1UpgradeRequestStatus,
+    /// Whether the request sent upstream was a CONNECT, once it has been sent.
+    upstream_connect_request: Option<bool>,
     /// The context from parent request, if this is a subrequest.
     pub subrequest_ctx: Option<Box<SubrequestCtx>>,
     /// Handle to allow spawning subrequests, assigned by the `Subrequest` app logic.
@@ -640,6 +642,7 @@ where
             ignore_downstream_range: false,
             upstream_headers_mutated_for_cache: false,
             h1_upgrade_request_status: H1UpgradeRequestStatus::default(),
+            upstream_connect_request: None,
             subrequest_ctx: None,
             subrequest_spawner: None, // optionally set later on
             downstream_modules_ctx: downstream_modules.build_ctx(),
@@ -763,6 +766,17 @@ where
         task: &mut HttpTask,
         seen_upgraded: &mut bool,
     ) -> Result<()> {
+        if *seen_upgraded
+            && matches!(task, HttpTask::Body(..))
+            && self.req_header().method == http::Method::CONNECT
+        {
+            // An upstream that frames its tunnel bytes as a body (an h2 CONNECT stream carries
+            // them in DATA frames) still sends tunnel bytes. Both sides agreed that this was a
+            // CONNECT before the tunnel was established.
+            if let HttpTask::Body(data, end) = std::mem::replace(task, HttpTask::Done) {
+                *task = HttpTask::UpgradedBody(data, end);
+            }
+        }
         match task {
             HttpTask::Header(resp, end) => {
                 if *seen_upgraded {
@@ -773,7 +787,9 @@ where
                     .await?;
                 reject_mismatched_h1_upgrade_101(self, resp, "downstream_module_header_filter")
                     .map_err(|e| e.into_in())?;
-                if resp.status == http::StatusCode::SWITCHING_PROTOCOLS
+                // A 101 completing an Upgrade, or a 2xx turning a CONNECT into a tunnel.
+                if (resp.status == http::StatusCode::SWITCHING_PROTOCOLS
+                    || resp.status.is_success())
                     && self.downstream_session.is_upgrade(resp) == Some(true)
                 {
                     *seen_upgraded = true;
@@ -908,6 +924,10 @@ where
         self.h1_upgrade_request_status = H1UpgradeRequestStatus {
             upstream: Some(upstream_is_upgrade_req),
         };
+    }
+
+    fn set_upstream_connect_request(&mut self, upstream_is_connect: bool) {
+        self.upstream_connect_request = Some(upstream_is_connect);
     }
 
     fn h1_upgrade_request_snapshot(&self) -> H1UpgradeRequestSnapshot {
@@ -1046,12 +1066,14 @@ impl H1UpgradeRequestSnapshot {
     }
 }
 
-/// Rejects a 101 response when the downstream and upstream H1 upgrade state differs.
+/// Rejects a 101 response when the downstream and upstream H1 upgrade state differs, and a 2xx
+/// response when only one side of the proxy sent a CONNECT.
 ///
 /// Upstream and downstream must agree that this request is an upgrade before a
 /// 101 can establish a tunnel. Otherwise one side changes protocol while the
 /// other stays in HTTP handling, allowing tunneled traffic to bypass request
-/// processing or corrupt the connection state.
+/// processing or corrupt the connection state. A 2xx response to CONNECT establishes
+/// a tunnel the same way, so both sides must agree that the request is a CONNECT.
 fn reject_mismatched_h1_upgrade_101<DS>(
     session: &Session<DS>,
     header: &ResponseHeader,
@@ -1060,6 +1082,19 @@ fn reject_mismatched_h1_upgrade_101<DS>(
 where
     DS: DownstreamSession,
 {
+    if header.status.is_success() {
+        let downstream_connect = session.req_header().method == http::Method::CONNECT;
+        return match session.upstream_connect_request {
+            Some(upstream_connect) if upstream_connect != downstream_connect => Error::e_explain(
+                InvalidHTTPHeader,
+                format!(
+                    "received {} response with mismatched upstream/downstream CONNECT status: stage={stage}, downstream_connect_req={downstream_connect}, upstream_connect_req={upstream_connect}",
+                    header.status.as_u16(),
+                ),
+            ),
+            _ => Ok(()),
+        };
+    }
     if header.status != http::StatusCode::SWITCHING_PROTOCOLS {
         return Ok(());
     }
@@ -2308,6 +2343,76 @@ mod tests {
         assert_eq!(err.etype(), &InvalidHTTPHeader);
         assert_eq!(err.esource(), &ErrorSource::Internal);
         assert!(written.lock().unwrap().is_empty());
+    }
+
+    async fn new_connect_request_session(written: Arc<Mutex<Vec<u8>>>) -> Session {
+        new_request_session(
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            written,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_tunnels_after_connect_2xx() {
+        let tunnel_tasks = [
+            HttpTask::UpgradedBody(Some(Bytes::from_static(b"hello")), true),
+            // an h2 upstream carries the tunnel as a body
+            HttpTask::Body(Some(Bytes::from_static(b"hello")), true),
+        ];
+        for tunnel_task in tunnel_tasks {
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let mut session = new_connect_request_session(written.clone()).await;
+            session.set_upstream_connect_request(true);
+
+            let response_done = session
+                .write_response_tasks(vec![
+                    HttpTask::Header(Box::new(ResponseHeader::build(200, None).unwrap()), false),
+                    tunnel_task,
+                ])
+                .await
+                .unwrap();
+
+            assert!(response_done);
+            assert!(session.was_upgraded());
+            let written = written.lock().unwrap().clone();
+            assert!(
+                written.starts_with(b"HTTP/1.1 200 OK\r\n") && written.ends_with(b"\r\n\r\nhello"),
+                "tunnel bytes should follow the header as-is: {:?}",
+                String::from_utf8_lossy(&written)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_rejects_2xx_with_connect_mismatch() {
+        // (downstream is CONNECT, upstream is CONNECT): a filter turned a CONNECT into a plain
+        // request upstream, or a plain request into a CONNECT
+        for (downstream_connect, upstream_connect) in [(true, false), (false, true)] {
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let mut session = if downstream_connect {
+                new_connect_request_session(written.clone()).await
+            } else {
+                new_request_session(
+                    b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                    written.clone(),
+                )
+                .await
+            };
+            session.set_upstream_connect_request(upstream_connect);
+
+            let err = session
+                .write_response_tasks(vec![HttpTask::Header(
+                    Box::new(ResponseHeader::build(200, None).unwrap()),
+                    false,
+                )])
+                .await
+                .unwrap_err();
+
+            assert_eq!(err.etype(), &InvalidHTTPHeader);
+            assert!(!session.was_upgraded());
+            assert!(written.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

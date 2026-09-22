@@ -852,8 +852,8 @@ async fn test_connect_proxying_allowed_h1() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = listener.local_addr().unwrap();
 
-    // Note per RFC CONNECT 2xx responses are not allowed to have response
-    // bodies, so this is non-standard behavior.
+    // Per RFC 9110 §9.3.6 a 2xx response to CONNECT has no content: the origin's
+    // Content-Length is ignored and the bytes after the header are tunnel bytes.
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 1024];
@@ -870,12 +870,9 @@ async fn test_connect_proxying_allowed_h1() {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    let mut buf = vec![0u8; 1024];
-    let read = stream.read(&mut buf).await.unwrap();
-    let resp = std::str::from_utf8(&buf[..read]).unwrap();
-    let status_line = resp.lines().next().unwrap_or("");
-    assert!(status_line.contains(" 200 "));
-    assert!(resp.ends_with("ok"));
+    let mut buf = vec![];
+    stream.read_to_end(&mut buf).await.unwrap();
+    assert_connect_tunnel_response(&buf, b"ok");
 }
 
 #[tokio::test]
@@ -903,12 +900,92 @@ async fn test_connect_proxying_allowed_h1_without_host() {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    let mut buf = vec![0u8; 1024];
-    let read = stream.read(&mut buf).await.unwrap();
-    let resp = std::str::from_utf8(&buf[..read]).unwrap();
-    let status_line = resp.lines().next().unwrap_or("");
-    assert!(status_line.contains(" 200 "));
-    assert!(resp.ends_with("ok"));
+    let mut buf = vec![];
+    stream.read_to_end(&mut buf).await.unwrap();
+    assert_connect_tunnel_response(&buf, b"ok");
+}
+
+#[tokio::test]
+async fn test_connect_proxying_allowed_h1_tunnels_both_ways() {
+    init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+
+    // An origin that accepts the CONNECT and then echoes the tunnel until the client closes.
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut req = vec![];
+        let mut buf = [0u8; 1024];
+        let header_end = loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0, "request header incomplete");
+            req.extend_from_slice(&buf[..n]);
+            if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        assert!(req.starts_with(b"CONNECT pingora.org:443 HTTP/1.1\r\n"));
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+        // tunnel bytes that arrived together with the request header
+        socket.write_all(&req[header_end..]).await.unwrap();
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            socket.write_all(&buf[..n]).await.unwrap();
+        }
+        let _ = socket.shutdown().await;
+    });
+
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    // "early" is sent before the client has seen the response
+    let request = format!(
+        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {}\r\n\r\nearly",
+        upstream_addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut resp = vec![];
+    read_until_suffix(&mut stream, &mut resp, b"early").await;
+    stream.write_all(b"ping").await.unwrap();
+    read_until_suffix(&mut stream, &mut resp, b"ping").await;
+
+    // closing our side ends the tunnel
+    stream.shutdown().await.unwrap();
+    stream.read_to_end(&mut resp).await.unwrap();
+    assert_connect_tunnel_response(&resp, b"earlyping");
+}
+
+/// Read from `stream` into `resp` until it ends with `suffix`.
+async fn read_until_suffix(stream: &mut TcpStream, resp: &mut Vec<u8>, suffix: &[u8]) {
+    let mut buf = [0u8; 1024];
+    while !resp.ends_with(suffix) {
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(n > 0, "connection closed early: {resp:?}");
+        resp.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// Assert that `resp` is a 2xx CONNECT response that opened a tunnel which then carried
+/// `tunnel_bytes`: the header has no framing headers, and the tunnel bytes follow it as-is.
+fn assert_connect_tunnel_response(resp: &[u8], tunnel_bytes: &[u8]) {
+    let header_end = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("complete response header")
+        + 4;
+    let header = std::str::from_utf8(&resp[..header_end]).unwrap();
+    let status_line = header.lines().next().unwrap_or("");
+    assert!(status_line.contains(" 200 "), "{header}");
+    let header_lower = header.to_ascii_lowercase();
+    assert!(!header_lower.contains("content-length"), "{header}");
+    assert!(!header_lower.contains("transfer-encoding"), "{header}");
+    assert_eq!(&resp[header_end..], tunnel_bytes);
 }
 
 /// Read a complete HTTP/1 header block. A single `read()` can return a partial

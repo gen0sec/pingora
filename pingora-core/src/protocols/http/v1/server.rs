@@ -682,11 +682,21 @@ impl HttpSession {
         self.response_written.as_deref()
     }
 
+    /// Is the request a CONNECT request
+    pub fn is_connect_req(&self) -> bool {
+        self.get_method() == Some(&Method::CONNECT)
+    }
+
     /// `Some(true)` if the this is a successful upgrade
     /// `Some(false)` if the request is an upgrade but the response refuses it
     /// `None` if the request is not an upgrade.
+    ///
+    /// A CONNECT request counts as an upgrade request, and any 2xx response to it as the
+    /// successful upgrade that turns the connection into a tunnel.
     pub fn is_upgrade(&self, header: &ResponseHeader) -> Option<bool> {
-        if self.is_upgrade_req() {
+        if self.is_connect_req() {
+            Some(is_connect_tunnel_resp(&Method::CONNECT, header))
+        } else if self.is_upgrade_req() {
             Some(is_upgrade_resp(header))
         } else {
             None
@@ -695,8 +705,9 @@ impl HttpSession {
 
     /// Was this request successfully turned into an upgraded connection?
     ///
-    /// Both the request had to have been an `Upgrade` request
-    /// and the response had to have been a `101 Switching Protocols`.
+    /// Either the request had to have been an `Upgrade` request
+    /// and the response had to have been a `101 Switching Protocols`,
+    /// or the request had to have been a CONNECT and the response a 2xx.
     pub fn was_upgraded(&self) -> bool {
         self.upgraded
     }
@@ -843,18 +854,40 @@ impl HttpSession {
             self.set_keepalive(None);
         }
 
+        let connect_tunnel =
+            self.is_connect_req() && is_connect_tunnel_resp(&Method::CONNECT, header);
+        if connect_tunnel {
+            // A 2xx response to CONNECT has no content, and the connection carries the tunnel
+            // until closed, so it can never be reused.
+            // https://www.rfc-editor.org/rfc/rfc9110#section-9.3.6
+            header.remove_header(&header::CONTENT_LENGTH);
+            header.remove_header(&header::TRANSFER_ENCODING);
+            header.remove_header(&header::CONNECTION);
+            self.set_keepalive(None);
+        } else if self.is_connect_req()
+            && !header.status.is_informational()
+            && self.body_reader.has_bytes_overread()
+        {
+            // The client sent tunnel bytes before learning whether the tunnel would be
+            // established. They are not an HTTP request, so the connection cannot be reused.
+            self.set_keepalive(None);
+        }
+
         // no need to add these headers to 1xx responses
         if !header.status.is_informational() && self.update_resp_headers {
             /* update headers */
             header.insert_header(header::DATE, date::get_cached_date())?;
 
-            // TODO: make these lazy static
-            let connection_value = if self.will_keepalive() {
-                "keep-alive"
-            } else {
-                "close"
-            };
-            header.insert_header(header::CONNECTION, connection_value)?;
+            // Connection options are meaningless once the connection becomes a tunnel.
+            if !connect_tunnel {
+                // TODO: make these lazy static
+                let connection_value = if self.will_keepalive() {
+                    "keep-alive"
+                } else {
+                    "close"
+                };
+                header.insert_header(header::CONNECTION, connection_value)?;
+            }
         }
 
         if header.status == 101 {
@@ -927,6 +960,11 @@ impl HttpSession {
 
     fn init_body_writer(&mut self, header: &ResponseHeader) {
         use http::StatusCode;
+        // A 2xx to CONNECT (204 included) makes the rest of the connection a tunnel.
+        if self.is_connect_req() && is_connect_tunnel_resp(&Method::CONNECT, header) {
+            self.body_writer.init_close_delimited();
+            return;
+        }
         /* the following responses don't have body 204, 304, and HEAD */
         if matches!(
             header.status,
@@ -1258,7 +1296,10 @@ impl HttpSession {
             // `abort_on_close` and the FIN handling above stay untouched
             // — this branch is exclusive to the pipelining case where
             // bytes (not FIN) arrived on the idle poll.
-            if self.pipelining_enabled && self.pipelined_idle_bytes_stashed {
+            // The same holds for CONNECT bytes stashed before the response below.
+            if self.pipelined_idle_bytes_stashed
+                && (self.pipelining_enabled || self.is_connect_req())
+            {
                 return std::future::pending().await;
             }
             // XXX: account for upgraded body reader change, if the read half split from the write half
@@ -1283,6 +1324,19 @@ impl HttpSession {
                     // will fail.
                     std::future::pending().await
                 }
+            } else if self.is_connect_req() && self.response_written.is_none() {
+                // A CONNECT client may send tunnel bytes before the response arrives
+                // (e.g. a TLS ClientHello right behind the request). Stash them on the body
+                // reader's overread surface: a 2xx response converts the reader to
+                // close-delimited, which replays them as the first tunnel bytes. Pend like
+                // the pipelining case below until the response is written.
+                // The reader must be initialized first: initializing it later would start
+                // from the (empty) preread body and drop the stashed bytes.
+                self.init_body_reader();
+                self.body_reader.push_body_overread(&probe[..read]);
+                self.pipelined_idle_bytes_stashed = true;
+                debug!("early CONNECT tunnel bytes stashed as overread ({read} bytes)");
+                std::future::pending().await
             } else if self.pipelining_enabled {
                 // The read bytes are the start of a pipelined next
                 // request on this keep-alive connection (RFC 9112
@@ -2978,6 +3032,164 @@ mod tests_stream {
         http_stream.read_request().await.unwrap();
         assert_eq!(&b"pingora.org:443"[..], http_stream.get_path());
         assert_eq!(Some(&Method::CONNECT), http_stream.get_method());
+    }
+
+    const CONNECT_REQ: &[u8] = b"CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\n\r\n";
+
+    #[rstest]
+    #[case::ok(200)]
+    #[case::no_content(204)]
+    #[tokio::test]
+    async fn connect_2xx_turns_into_tunnel(#[case] status: u16) {
+        init_log();
+        let status_line = format!(
+            "HTTP/1.1 {status} {}\r\n\r\n",
+            StatusCode::from_u16(status)
+                .unwrap()
+                .canonical_reason()
+                .unwrap()
+        );
+        let mock_io = Builder::new()
+            .read(CONNECT_REQ)
+            .write(status_line.as_bytes())
+            .read(b"client hello")
+            .write(b"server hello")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_connect_req());
+        // a CONNECT request has no body before the tunnel is established
+        assert!(http_stream.is_body_done());
+
+        // framing headers are dropped: a 2xx to CONNECT has no content
+        let mut response = ResponseHeader::build(status, None).unwrap();
+        response.insert_header("Content-Length", "5").unwrap();
+        response
+            .insert_header("Transfer-Encoding", "chunked")
+            .unwrap();
+        assert_eq!(Some(true), http_stream.is_upgrade(&response));
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        assert!(http_stream.was_upgraded());
+        assert!(!http_stream.will_keepalive());
+
+        // both directions now pass tunnel bytes through as-is
+        assert!(!http_stream.is_body_done());
+        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(buf, &b"client hello"[..]);
+        http_stream.write_body(b"server hello").await.unwrap();
+        // EOF ends the tunnel
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        assert!(http_stream.is_body_done());
+    }
+
+    #[tokio::test]
+    async fn connect_2xx_drops_connection_header() {
+        init_log();
+        let mock_io = Builder::new()
+            .read(CONNECT_REQ)
+            .write(b"HTTP/1.1 200 OK\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        response.insert_header("Connection", "keep-alive").unwrap();
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        assert!(http_stream.was_upgraded());
+    }
+
+    #[tokio::test]
+    async fn connect_tunnel_bytes_sent_with_the_request() {
+        init_log();
+        // the client does not wait for the response before sending tunnel bytes
+        let input = [CONNECT_REQ, b"client hello".as_slice()].concat();
+        let mock_io = Builder::new()
+            .read(&input)
+            .write(b"HTTP/1.1 200 OK\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_body_done());
+
+        let response = ResponseHeader::build(200, None).unwrap();
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(buf, &b"client hello"[..]);
+    }
+
+    #[tokio::test]
+    async fn connect_tunnel_bytes_sent_while_idle() {
+        init_log();
+        let mock_io = Builder::new()
+            .read(CONNECT_REQ)
+            .read(b"client hello")
+            .write(b"HTTP/1.1 200 OK\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+
+        // early tunnel bytes are held back instead of failing as "data after end of body"
+        let idle = tokio::time::timeout(
+            Duration::from_millis(10),
+            http_stream.read_body_or_idle(true),
+        )
+        .await;
+        assert!(idle.is_err(), "idle read should pend: {idle:?}");
+
+        let response = ResponseHeader::build(200, None).unwrap();
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        let mut buf = vec![];
+        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
+            buf.put_slice(&b);
+        }
+        assert_eq!(buf, b"client hello");
+    }
+
+    #[rstest]
+    #[case::early_bytes(true)]
+    #[case::no_early_bytes(false)]
+    #[tokio::test]
+    async fn connect_refused_is_a_normal_response(#[case] early_bytes: bool) {
+        init_log();
+        let input = if early_bytes {
+            [CONNECT_REQ, b"client hello".as_slice()].concat()
+        } else {
+            CONNECT_REQ.to_vec()
+        };
+        let mock_io = Builder::new()
+            .read(&input)
+            .write(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+        http_stream.set_keepalive(Some(0));
+
+        let mut response = ResponseHeader::build(407, Some(1)).unwrap();
+        response.insert_header("Content-Length", "0").unwrap();
+        assert_eq!(Some(false), http_stream.is_upgrade(&response));
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        assert!(!http_stream.was_upgraded());
+        // tunnel bytes sent ahead of a refusal are not a pipelined request
+        assert_eq!(!early_bytes, http_stream.will_keepalive());
     }
 
     #[test]

@@ -648,6 +648,11 @@ impl HttpSession {
         header.remove_header(&header::UPGRADE);
         header.remove_header(&HeaderName::from_static("keep-alive"));
         header.remove_header(&HeaderName::from_static("proxy-connection"));
+        if self.is_connect_tunnel_resp(&header) {
+            // A 2xx response to CONNECT has no content: DATA frames carry the tunnel instead.
+            // https://www.rfc-editor.org/rfc/rfc9113#section-8.5
+            header.remove_header(&header::CONTENT_LENGTH);
+        }
 
         let resp = Response::from_parts(header.as_owned_parts(), ());
 
@@ -660,6 +665,25 @@ impl HttpSession {
         self.send_response_body = Some(body_writer);
         self.ended = self.ended || end;
         Ok(())
+    }
+
+    fn is_connect_tunnel_resp(&self, header: &ResponseHeader) -> bool {
+        self.request_header.method == http::Method::CONNECT && header.status.is_success()
+    }
+
+    /// Whether the stream became a tunnel: the request was a CONNECT, and a 2xx response to it
+    /// was sent. From then on the DATA frames in both directions carry opaque tunnel bytes.
+    pub fn was_upgraded(&self) -> bool {
+        self.response_written
+            .as_deref()
+            .is_some_and(|resp| self.is_connect_tunnel_resp(resp))
+    }
+
+    /// `Some(true)` if `header` turns this CONNECT stream into a tunnel, `Some(false)` if it
+    /// refuses the tunnel, and `None` if the request is not a CONNECT.
+    pub fn is_upgrade(&self, header: &ResponseHeader) -> Option<bool> {
+        (self.request_header.method == http::Method::CONNECT)
+            .then(|| self.is_connect_tunnel_resp(header))
     }
 
     /// Write response body to the client. See [Self::write_response_header] for how to use `end`.
@@ -768,9 +792,19 @@ impl HttpSession {
                     }
                     None => end,
                 },
+                // A tunnelled CONNECT stream carries the upstream's opaque bytes as DATA frames.
+                HttpTask::UpgradedBody(data, end) if self.was_upgraded() => match data {
+                    Some(d) => {
+                        if !d.is_empty() {
+                            self.write_body(d, end).await.map_err(|e| e.into_down())?;
+                        }
+                        end
+                    }
+                    None => end,
+                },
                 HttpTask::UpgradedBody(..) => {
-                    // Seeing an Upgraded body means that the upstream session
-                    // was H1.1 that upgraded.
+                    // Outside a CONNECT tunnel, seeing an Upgraded body means that the
+                    // upstream session was H1.1 that upgraded.
                     //
                     // While the downstream H2 session may encapsulate the opaque body bytes,
                     // this represents an undefined discrepancy and change between how
