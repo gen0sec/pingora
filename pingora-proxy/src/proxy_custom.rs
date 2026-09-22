@@ -110,6 +110,7 @@ where
         }
 
         session.set_upstream_h1_upgrade_request_status(is_h1_upgrade_req(&req));
+        session.set_upstream_connect_request(req.method == http::Method::CONNECT);
 
         session.upstream_compression.request_filter(&req);
         let body_empty = session.as_mut().is_body_empty();

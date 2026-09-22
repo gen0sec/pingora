@@ -183,6 +183,8 @@ where
             }
         }
 
+        session.set_upstream_connect_request(req.method == http::Method::CONNECT);
+
         if authority_policy.is_standard() {
             if let Err(e) = reconcile_upstream_authority(&mut req) {
                 return (false, Some(e.into_in()));
@@ -571,6 +573,7 @@ where
             let support_cache_partial_read =
                 session.cache.support_streaming_partial_write() == Some(true);
             let upgraded = session.was_upgraded();
+            let is_connect = session.req_header().method == http::Method::CONNECT;
 
             // Similar logic in h1 need to reserve capacity first to avoid deadlock
             // But we don't need to do the same because the h2 client_body pipe is unbounded (never block)
@@ -667,7 +670,7 @@ where
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
                         };
-                        if session.was_upgraded() {
+                        if session.was_upgraded() && !is_connect {
                             return Error::e_explain(H2Error, "upgraded while proxying to h2 session");
                         }
                         response_state.maybe_set_upstream_done(response_done);
@@ -692,9 +695,10 @@ where
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
                         };
-                        if session.was_upgraded() {
+                        if session.was_upgraded() && !is_connect {
                             // it is very weird if the downstream session decides to upgrade
-                            // since the client h2 session cannot, return an error on this case
+                            // since the client h2 session cannot, return an error on this case.
+                            // A CONNECT is the exception: the h2 stream carries the tunnel.
                             return Error::e_explain(H2Error, "upgraded while proxying to h2 session");
                         }
                         response_state.maybe_set_upstream_done(response_done);
@@ -949,15 +953,27 @@ where
                     }
                 }
 
+                if !from_cache {
+                    reject_mismatched_h1_upgrade_101(session, &header, "h2_upstream_filter")
+                        .map_err(|e| e.into_up())?;
+                }
                 self.inner
                     .response_filter(session, &mut header, ctx)
                     .await?;
+                if !from_cache {
+                    // Re-check after response_filter in case it changed the final status.
+                    reject_mismatched_h1_upgrade_101(session, &header, "h2_response_filter")
+                        .map_err(|e| e.into_in())?;
+                }
                 /* Downgrade the version so that write_response_header won't panic */
                 header.set_version(Version::HTTP_11);
 
                 // these status codes / method cannot have body, so no need to add chunked encoding
+                // (a 2xx to CONNECT turns the connection into a tunnel instead)
                 let no_body = session.req_header().method == "HEAD"
-                    || matches!(header.status.as_u16(), 204 | 304);
+                    || matches!(header.status.as_u16(), 204 | 304)
+                    || (session.req_header().method == Method::CONNECT
+                        && header.status.is_success());
 
                 /* Add chunked header to tell downstream to use chunked encoding
                  * during the absent of content-length in h2 */
