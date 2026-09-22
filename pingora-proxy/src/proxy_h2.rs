@@ -230,7 +230,9 @@ where
         let host = req.remove_header(&http::header::HOST);
 
         session.upstream_compression.request_filter(&req);
-        let body_empty = session.as_mut().is_body_empty();
+        // A CONNECT stream carries the tunnel after a 2xx, so it must not be ended up front even
+        // though the request has no content (an h1 CONNECT has no body at all).
+        let body_empty = req.method != http::Method::CONNECT && session.as_mut().is_body_empty();
 
         // whether we support sending END_STREAM on HEADERS if body is empty
         let send_end_stream = req.send_end_stream().expect("req must be h2");
@@ -574,12 +576,16 @@ where
                 session.cache.support_streaming_partial_write() == Some(true);
             let upgraded = session.was_upgraded();
             let is_connect = session.req_header().method == http::Method::CONNECT;
+            // Data a CONNECT client sends before the tunnel is established (an h2 client may
+            // send DATA early) is not a request body. Leave it unread until a 2xx establishes
+            // the tunnel. An h1 CONNECT has no body, so it keeps idling as usual.
+            let hold_connect_data = is_connect && !upgraded && downstream_state.is_reading();
 
             // Similar logic in h1 need to reserve capacity first to avoid deadlock
             // But we don't need to do the same because the h2 client_body pipe is unbounded (never block)
             tokio::select! {
                 // NOTE: cannot avoid this copy since h2 owns the buf
-                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() => {
+                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() && !hold_connect_data => {
                     debug!("downstream event");
                     let body = match body {
                         Ok(b) => b,
@@ -674,6 +680,13 @@ where
                             return Error::e_explain(H2Error, "upgraded while proxying to h2 session");
                         }
                         response_state.maybe_set_upstream_done(response_done);
+                        Self::update_connect_downstream_state(
+                            session,
+                            is_connect,
+                            upgraded,
+                            response_done,
+                            &mut downstream_state,
+                        );
                     } else {
                         debug!("empty upstream event");
                         response_state.maybe_set_upstream_done(true);
@@ -702,6 +715,13 @@ where
                             return Error::e_explain(H2Error, "upgraded while proxying to h2 session");
                         }
                         response_state.maybe_set_upstream_done(response_done);
+                        Self::update_connect_downstream_state(
+                            session,
+                            is_connect,
+                            upgraded,
+                            response_done,
+                            &mut downstream_state,
+                        );
                     } else {
                         debug!("empty upstream event");
                         response_state.maybe_set_upstream_done(true);
@@ -1053,6 +1073,29 @@ where
             }
         }
         res
+    }
+
+    /// Keep the downstream state of a CONNECT in step with its tunnel after an upstream task:
+    /// once a 2xx establishes the tunnel, resume reading the downstream (an h1 CONNECT had no
+    /// body until then), and once a refusal completes, stop waiting on the data held back.
+    fn update_connect_downstream_state(
+        session: &Session<DS>,
+        is_connect: bool,
+        was_upgraded: bool,
+        response_done: bool,
+        downstream_state: &mut DownstreamStateMachine,
+    ) {
+        if !is_connect {
+            return;
+        }
+        if session.was_upgraded() {
+            if !was_upgraded && downstream_state.can_poll() {
+                trace!("reset downstream state on CONNECT tunnel");
+                downstream_state.reset();
+            }
+        } else {
+            downstream_state.maybe_finished(response_done);
+        }
     }
 
     async fn send_body_to2(

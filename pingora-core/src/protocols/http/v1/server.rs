@@ -56,6 +56,8 @@ enum ProxyTaskWriter {
     WritingBody(bool),
     /// Currently finishing the body (writing last chunk + flush).
     FinishingBody,
+    /// Currently shutting down the write side of a CONNECT tunnel after its body finished.
+    ShuttingDownTunnel,
 }
 
 /// State for the cancel-safe proxy task write API.
@@ -864,10 +866,11 @@ impl HttpSession {
             header.remove_header(&header::TRANSFER_ENCODING);
             header.remove_header(&header::CONNECTION);
             self.set_keepalive(None);
-        } else if self.is_connect_req()
-            && !header.status.is_informational()
-            && self.body_reader.has_bytes_overread()
-        {
+        } else if self.is_connect_req() && !header.status.is_informational() && {
+            // Early bytes stay in the preread body until the reader is initialized.
+            self.init_body_reader();
+            self.body_reader.has_bytes_overread()
+        } {
             // The client sent tunnel bytes before learning whether the tunnel would be
             // established. They are not an HTTP request, so the connection cannot be reused.
             self.set_keepalive(None);
@@ -1109,8 +1112,15 @@ impl HttpSession {
         }
     }
 
+    /// Whether a 2xx response turned this CONNECT into a tunnel.
+    fn is_connect_tunnel(&self) -> bool {
+        self.upgraded && self.is_connect_req()
+    }
+
     fn maybe_force_close_body_reader(&mut self) {
-        if self.upgraded && !self.body_reader.body_done() {
+        // A CONNECT tunnel half-closes instead: the client may still be sending after the
+        // upstream finished.
+        if self.upgraded && !self.is_connect_tunnel() && !self.body_reader.body_done() {
             // response is done, reset the request body to close
             self.body_reader.init_content_length(0, b"");
         }
@@ -1121,11 +1131,15 @@ impl HttpSession {
     /// For chunked encoding response, this call will also send the last chunk.
     /// For upgraded sessions, this call will also close the reading of the client body.
     pub async fn finish_body(&mut self) -> Result<Option<usize>> {
+        let was_finished = self.body_writer.finished();
         let res = self.body_writer.finish(&mut self.underlying_stream).await?;
         self.underlying_stream
             .flush()
             .await
             .or_err(WriteError, "flushing body")?;
+        if self.is_connect_tunnel() && !was_finished {
+            self.shutdown_tunnel_write().await?;
+        }
 
         trace!(
             "finish body (response body writer), upgraded: {}",
@@ -1133,6 +1147,16 @@ impl HttpSession {
         );
         self.maybe_force_close_body_reader();
         Ok(res)
+    }
+
+    /// Half-close a CONNECT tunnel: signal the end of the tunnel bytes to the client (a TCP FIN)
+    /// while still reading what the client sends.
+    async fn shutdown_tunnel_write(&mut self) -> Result<()> {
+        trace!("shutting down write side of CONNECT tunnel");
+        self.underlying_stream
+            .shutdown()
+            .await
+            .or_err(WriteError, "shutting down CONNECT tunnel write side")
     }
 
     /// Return how many response body bytes (application, not wire) already sent downstream
@@ -1273,6 +1297,11 @@ impl HttpSession {
     /// is called after the connection is already marked half-closed and `abort_on_close` is
     /// **disabled**, then it will pend forever.
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+        if self.is_connect_tunnel() && self.is_body_done() {
+            // The client half-closed its side of the tunnel (its EOF ended the tunnel bytes).
+            // That is not an abort: the other side of the tunnel may still be sending.
+            return std::future::pending().await;
+        }
         if no_body_expected || self.is_body_done() {
             if self.half_closed {
                 if self.abort_on_close {
@@ -1722,6 +1751,12 @@ impl HttpSession {
                             .await
                             .map_err(|e| e.into_down())?;
                     }
+                    ProxyTaskWriter::ShuttingDownTunnel => {
+                        // shutdown can be resumed after cancellation
+                        self.shutdown_tunnel_write()
+                            .await
+                            .map_err(|e| e.into_down())?;
+                    }
                 }
 
                 match self
@@ -1739,7 +1774,16 @@ impl HttpSession {
                     }
                     ProxyTaskWriter::FinishingBody => {
                         end_stream = true;
+                        if self.is_connect_tunnel() {
+                            self.proxy_task_state.current_writer =
+                                Some(ProxyTaskWriter::ShuttingDownTunnel);
+                            continue;
+                        }
                         self.maybe_force_close_body_reader();
+                        break; // fine to break after finish, no tasks should be queued after
+                    }
+                    ProxyTaskWriter::ShuttingDownTunnel => {
+                        end_stream = true;
                         break; // fine to break after finish, no tasks should be queued after
                     }
                 }
@@ -3161,10 +3205,16 @@ mod tests_stream {
     }
 
     #[rstest]
-    #[case::early_bytes(true)]
-    #[case::no_early_bytes(false)]
+    #[case::early_bytes(true, true)]
+    #[case::no_early_bytes(false, true)]
+    // the reuse guard must not depend on this option initializing the body reader
+    #[case::early_bytes_no_close_before_finish(true, false)]
+    #[case::no_early_bytes_no_close_before_finish(false, false)]
     #[tokio::test]
-    async fn connect_refused_is_a_normal_response(#[case] early_bytes: bool) {
+    async fn connect_refused_is_a_normal_response(
+        #[case] early_bytes: bool,
+        #[case] close_on_response_before_downstream_finish: bool,
+    ) {
         init_log();
         let input = if early_bytes {
             [CONNECT_REQ, b"client hello".as_slice()].concat()
@@ -3177,6 +3227,8 @@ mod tests_stream {
             .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.update_resp_headers = false;
+        http_stream.close_on_response_before_downstream_finish =
+            close_on_response_before_downstream_finish;
         http_stream.read_request().await.unwrap();
         http_stream.set_keepalive(Some(0));
 

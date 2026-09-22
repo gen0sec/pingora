@@ -110,7 +110,10 @@ where
             }
         }
 
-        if let Err(e) = finalize_h1_upstream_request_framing(&mut req, !session.is_body_empty()) {
+        // A CONNECT has no content (RFC 9110 §9.3.6): anything the client sends is tunnel data,
+        // which is only forwarded once a 2xx establishes the tunnel.
+        let has_body = req.method != http::Method::CONNECT && !session.is_body_empty();
+        if let Err(e) = finalize_h1_upstream_request_framing(&mut req, has_body) {
             return (false, true, Some(e));
         }
 
@@ -329,8 +332,12 @@ where
                     match send_body_to1(client_session, body).await {
                         Ok(send_done) => {
                             request_done = send_done;
-                            // An upgraded request is terminated when either side is done
-                            if request_done && client_session.was_upgraded() {
+                            // An upgraded request is terminated when either side is done,
+                            // except a CONNECT tunnel, which half-closes and keeps reading
+                            if request_done
+                                && client_session.was_upgraded()
+                                && !client_session.is_connect_req()
+                            {
                                 response_done = true;
                             }
                         },
@@ -481,6 +488,7 @@ where
         }
 
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
+        let is_connect = session.req_header().method == http::Method::CONNECT;
 
         let buffer = session.as_ref().get_retry_buffer();
 
@@ -551,13 +559,17 @@ where
             let support_cache_partial_read =
                 session.cache.support_streaming_partial_write() == Some(true);
             let upgraded = session.was_upgraded();
+            // Data a CONNECT client sends before the tunnel is established (an h2 client may
+            // send DATA early) is not a request body. Leave it unread until a 2xx establishes
+            // the tunnel. An h1 CONNECT has no body, so it keeps idling as usual.
+            let hold_connect_data = is_connect && !upgraded && downstream_state.is_reading();
 
             tokio::select! {
                 // only try to send to pipe if there is capacity to avoid deadlock
                 // Otherwise deadlock could happen if both upstream and downstream are blocked
                 // on sending to their corresponding pipes which are both full.
                 body = session.downstream_session.read_body_or_idle(downstream_state.is_done()),
-                    if downstream_state.can_poll() && send_permit.is_ok() => {
+                    if downstream_state.can_poll() && send_permit.is_ok() && !hold_connect_data => {
 
                     debug!("downstream event");
                     let body = match body {
@@ -591,7 +603,8 @@ where
                     };
                     // If the request is websocket, `None` body means the request is closed.
                     // Set the response to be done as well so that the request completes normally.
-                    if body.is_none() && session.was_upgraded() {
+                    // A CONNECT tunnel half-closes instead and keeps forwarding the response.
+                    if body.is_none() && session.was_upgraded() && !is_connect {
                         response_state.maybe_set_upstream_done(true);
                     }
                     // TODO: consider just drain this if serve_from_cache is set
@@ -637,6 +650,10 @@ where
                         response_state.maybe_set_upstream_done(response_done);
                         // unsuccessful upgrade response may force the request done
                         downstream_state.maybe_finished(session.is_body_done());
+                        // a refused CONNECT never reads the data held back for the tunnel
+                        downstream_state.maybe_finished(
+                            is_connect && response_done && !session.was_upgraded(),
+                        );
                     } else {
                         debug!("empty upstream event");
                         response_state.maybe_set_upstream_done(true);
@@ -670,6 +687,10 @@ where
                         // unsuccessful upgrade response (or end of upstream upgraded conn,
                         // which forces the body reader to complete) may force the request done
                         downstream_state.maybe_finished(session.is_body_done());
+                        // a refused CONNECT never reads the data held back for the tunnel
+                        downstream_state.maybe_finished(
+                            is_connect && response_done && !session.was_upgraded(),
+                        );
                     } else {
                         debug!("empty upstream event");
                         response_state.maybe_set_upstream_done(true);

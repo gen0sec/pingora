@@ -1049,6 +1049,7 @@ fn test_main() {
     let http_logic = proxy_service_http_connect.app_logic_mut().unwrap();
     let mut http_server_options = HttpServerOptions::default();
     http_server_options.allow_connect_method_proxying = true;
+    http_server_options.h2c = true;
     http_logic.server_options = Some(http_server_options);
     proxy_service_http_connect.add_tcp("0.0.0.0:6160");
 
