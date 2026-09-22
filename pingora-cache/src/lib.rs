@@ -46,12 +46,15 @@ mod variance;
 
 use crate::max_file_size::MaxFileSizeTracker;
 use admission::{AdmissionPolicy, Decision};
+pub use eviction::{CacheEntryId, CacheEntryKey, CacheEntryKeyRef};
 pub use key::CacheKey;
-use lock::{CacheKeyLockImpl, LockStatus, Locked};
+use lock::{CacheKeyLockImpl, LockStatus, LockWaitOutcome, Locked, UnusableFills, WaitOutcome};
 pub use memory::MemCache;
 pub use meta::{set_compression_dict_content, set_compression_dict_path};
 pub use meta::{CacheMeta, CacheMetaDefaults};
-pub use storage::{HitHandler, MissHandler, PurgeType, Storage};
+pub use storage::{
+    HitHandler, MissHandler, PurgeAction, PurgeOutcome, PurgeTarget, PurgeType, Storage,
+};
 pub use variance::VarianceBuilder;
 
 pub mod prelude {}
@@ -182,6 +185,21 @@ pub struct HttpCacheDigest {
     pub lookup_duration: Option<Duration>,
     /// Admission decision made for an absent key, if an admission policy was configured.
     pub admission: Option<Decision>,
+    /// Set when a reader stopped waiting over a published fill it could not use.
+    /// See [`lock::UnusableFills`].
+    pub lock_abandon: Option<LockAbandon>,
+}
+
+/// A cache-lock wait abandoned over a fill the reader could not use. One value
+/// rather than two options, because the two are only ever known together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockAbandon {
+    /// Why this reader cannot use the fill, from its own matched
+    /// [`lock::UnusableFill`]. The writer publishes only tokens; the reason is the
+    /// reader's, wrapped as [`NoCacheReason::Custom`].
+    pub reason: NoCacheReason,
+    /// The published token it matched.
+    pub token: u64,
 }
 
 /// Convenience function to add a duration to an optional duration
@@ -231,8 +249,22 @@ impl RespCacheable {
 /// For example, should an existing fresh asset be revalidated or re-retrieved altogether.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForcedFreshness {
-    /// Indicates the asset should be considered stale and revalidated
+    /// Indicates the asset should be considered stale and revalidated, with its
+    /// stale-while-revalidate and stale-if-error windows closed so that readers wait
+    /// on the revalidation
     ForceExpired,
+
+    /// Indicates the asset should be considered stale, leaving its
+    /// stale-while-revalidate and stale-if-error windows to decide whether the stale
+    /// body can still be served while it revalidates
+    ///
+    /// `expired_at` is when the asset went out of service, such as the timestamp a purge was
+    /// recorded at. [`CacheMeta::expire_at`] applies it and explains why it has to be that
+    /// point rather than the time of the lookup.
+    ///
+    /// `None` when the asset is out of service but the caller does not know when it went out,
+    /// which leaves the windows measured from the asset's own deadline.
+    ForceExpiredServeStale { expired_at: Option<SystemTime> },
 
     /// Indicates the asset should be considered absent and treated like a miss
     /// instead of a hit
@@ -253,6 +285,10 @@ pub enum HitStatus {
 
     /// The asset was marked as expired, and should be treated as stale
     ForceExpired,
+
+    /// The asset was marked as expired without closing its serve stale windows, so
+    /// the stale body may still be served while it revalidates
+    ForceExpiredServeStale,
 
     /// The asset was marked as absent, and should be treated as a miss
     ForceMiss,
@@ -322,6 +358,10 @@ struct HttpCacheInner {
     // when set, an asset will be rejected from the cache if it exceeds configured size in bytes
     pub max_file_size_tracker: Option<MaxFileSizeTracker>,
     pub predictor: Option<&'static (dyn predictor::CacheablePredictor + Sync)>,
+    // Why the predictor considered this key uncacheable, captured in bypass() so later
+    // phases report the reason they acted on rather than inferring one. Outlives cache
+    // disablement because it is read after the response header arrives.
+    pub predicted_uncacheable_reason: Option<NoCacheReason>,
 }
 
 #[derive(Debug, Default)]
@@ -383,6 +423,24 @@ impl HttpCache {
                     .and_then(|ie| ie.storage.as_any().downcast_ref::<T>())
             })
             .is_some()
+    }
+
+    /// Say something about this request's cache fill, so readers coalescing behind
+    /// it that cannot use it stop waiting. See [`lock::UnusableFills`] for the
+    /// reader's side.
+    ///
+    /// No-op unless this request holds the write lock. Each call **replaces** the
+    /// last, so publish the whole set each time.
+    pub fn lock_publish_fill_tokens(&self, tokens: &[u64]) {
+        if let Some(Locked::Write(permit)) = self
+            .inner
+            .as_ref()
+            .and_then(|inner| inner.enabled_ctx.as_ref())
+            .and_then(|enabled| enabled.lock_ctx.as_ref())
+            .and_then(|lock_ctx| lock_ctx.lock.as_ref())
+        {
+            permit.publish(tokens);
+        }
     }
 
     /// Release the cache lock if the current request is a cache writer.
@@ -479,10 +537,23 @@ impl HttpCache {
             CachePhase::CacheKey => {
                 // before cache lookup / found / miss
                 self.phase = CachePhase::Bypass;
-                self.inner_enabled_mut()
-                    .traces
+                // Record why the predictor gave up on this key while we still know.
+                // Reading it later would race with concurrent requests re-marking the key.
+                let predicted_reason = self
+                    .inner()
+                    .predictor
+                    .and_then(|predictor| predictor.predicted_uncacheable_reason(self.cache_key()));
+                self.inner_mut().predicted_uncacheable_reason = predicted_reason;
+
+                let traces = &mut self.inner_enabled_mut().traces;
+                traces
                     .cache_span
                     .set_tag(|| trace::Tag::new("bypassed", true));
+                if let Some(reason) = predicted_reason {
+                    traces
+                        .cache_span
+                        .set_tag(|| trace::Tag::new("bypass_reason", reason.as_str()));
+                }
             }
             _ => panic!("wrong phase to bypass HttpCache {:?}", self.phase),
         }
@@ -538,6 +609,7 @@ impl HttpCache {
                     key: None,
                     max_file_size_tracker: None,
                     predictor,
+                    predicted_uncacheable_reason: None,
                 }));
             }
             _ => panic!("Cannot enable already enabled HttpCache {:?}", self.phase),
@@ -767,7 +839,9 @@ impl HttpCache {
 
         self.phase = match hit_status {
             HitStatus::Fresh | HitStatus::ForceFresh => CachePhase::Hit,
-            HitStatus::Expired | HitStatus::ForceExpired => CachePhase::Stale,
+            HitStatus::Expired | HitStatus::ForceExpired | HitStatus::ForceExpiredServeStale => {
+                CachePhase::Stale
+            }
             HitStatus::FailedHitFilter | HitStatus::ForceMiss => self.phase,
         };
 
@@ -798,11 +872,12 @@ impl HttpCache {
             inner_enabled.traces.start_hit_span(phase, hit_status);
             inner_enabled.traces.log_meta_in_hit_span(&meta);
             if let Some(eviction) = inner_enabled.eviction {
-                // TODO: make access() accept CacheKey
                 let cache_key = key.to_compact();
                 if hit_handler.should_count_access() {
                     let size = hit_handler.get_eviction_weight();
-                    eviction.access(&cache_key, size, meta.0.internal.fresh_until);
+                    let entry_key =
+                        eviction::CacheEntryKey::from_entry_id(cache_key, hit_handler.entry_id());
+                    eviction.access(&entry_key, size, meta.0.internal.fresh_until);
                 }
             }
             inner_enabled.meta = Some(meta);
@@ -1003,11 +1078,12 @@ impl HttpCache {
                     .enabled_ctx
                     .as_mut()
                     .expect("cache enabled on miss and expired");
-                if inner_enabled.miss_handler.is_none() {
+                let Some(miss_handler) = inner_enabled.miss_handler.take() else {
                     // already finished, we allow calling this function more than once
                     return Ok(());
-                }
-                let miss_handler = inner_enabled.miss_handler.take().unwrap();
+                };
+                // Save the entry ID before `finish` consumes the miss handler.
+                let entry_id = miss_handler.entry_id();
                 let finish_result = miss_handler.finish().await;
                 let key = inner
                     .key
@@ -1036,12 +1112,13 @@ impl HttpCache {
                 if let Some(eviction) = inner_enabled.eviction {
                     let cache_key = key.to_compact();
                     let meta = inner_enabled.meta.as_ref().unwrap();
+                    let entry_key = eviction::CacheEntryKey::from_entry_id(cache_key, entry_id);
                     let evicted = match size {
                         MissFinishType::Created(size) => {
-                            eviction.admit(cache_key, size, meta.0.internal.fresh_until)
+                            eviction.admit(entry_key, size, meta.0.internal.fresh_until)
                         }
                         MissFinishType::Appended(size, max_size) => {
-                            eviction.increment_weight(&cache_key, size, max_size)
+                            eviction.increment_weight(&entry_key, size, max_size)
                         }
                     };
                     // actual eviction can be done async
@@ -1050,9 +1127,13 @@ impl HttpCache {
                     let storage = inner_enabled.storage;
                     tokio::task::spawn(async move {
                         for item in evicted {
-                            if let Err(e) = storage.purge(&item, PurgeType::Eviction, &handle).await
+                            let target = storage::PurgeTarget::Exact(&item);
+                            if let Err(e) =
+                                storage.purge(target, PurgeType::Eviction, &handle).await
                             {
-                                warn!("Failed to purge {item} during eviction for finish miss handler: {e}");
+                                warn!(
+                                    "Failed to purge {target} during eviction for finish miss handler: {e}"
+                                );
                             }
                         }
                     });
@@ -1605,33 +1686,57 @@ impl HttpCache {
     }
 
     /// Wait for the cache read lock to be unlocked
+    ///
+    /// A request carrying an [`lock::UnusableFills`] on its cache key can also stop
+    /// early with [`LockWaitOutcome::Abandoned`], which [`Self::lock_abandon`] keeps
+    /// afterwards.
+    ///
     /// # Panic
     /// Check [Self::is_cache_locked()], panic if this request doesn't have a read lock.
-    pub async fn cache_lock_wait(&mut self) -> LockStatus {
+    pub async fn cache_lock_wait(&mut self) -> LockWaitOutcome {
+        // Taken before the mutable borrow below. Naming nothing waits as always.
+        let unusable = self
+            .maybe_cache_key()
+            .and_then(|key| key.extensions.get::<UnusableFills>())
+            .cloned();
+
         let inner_enabled = self.inner_enabled_mut();
         #[cfg_attr(not(feature = "trace"), allow(unused_mut))]
         let mut span = inner_enabled.traces.child("cache_lock");
         // should always call is_cache_locked() before this function, which should guarantee that
         // the inner cache has a read lock and lock ctx
-        let (read_lock, status) = if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
+        let (read_lock, outcome) = if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
             let lock = lock_ctx.lock.take(); // remove the lock from self
             if let Some(Locked::Read(r)) = lock {
                 let now = Instant::now();
                 // it's possible for a request to be locked more than once,
                 // so wait the remainder of our configured timeout
-                let status = if let Some(wait_timeout) = lock_ctx.wait_timeout {
+                let wait = async {
+                    match unusable.as_ref() {
+                        Some(unusable) => r.wait_unless_published(unusable).await,
+                        None => {
+                            r.wait().await;
+                            WaitOutcome::Released
+                        }
+                    }
+                };
+                let outcome = if let Some(wait_timeout) = lock_ctx.wait_timeout {
                     let wait_timeout =
                         wait_timeout.saturating_sub(self.lock_duration().unwrap_or(Duration::ZERO));
-                    match timeout(wait_timeout, r.wait()).await {
-                        Ok(()) => r.lock_status(),
-                        Err(_) => LockStatus::WaitTimeout,
+                    match timeout(wait_timeout, wait).await {
+                        Ok(outcome) => Self::wait_result(&r, outcome),
+                        Err(_) => LockWaitOutcome::WaitTimeout,
                     }
                 } else {
-                    r.wait().await;
-                    r.lock_status()
+                    Self::wait_result(&r, wait.await)
                 };
                 self.digest.add_lock_duration(now.elapsed());
-                (r, status)
+                // On the digest as well as returned: a logging filter reports it
+                // long after the caller has acted on the outcome.
+                if let LockWaitOutcome::Abandoned { reason, token } = outcome {
+                    self.digest.lock_abandon = Some(LockAbandon { reason, token });
+                }
+                (r, outcome)
             } else {
                 panic!("cache_lock_wait on wrong type of lock")
             }
@@ -1641,14 +1746,55 @@ impl HttpCache {
         if let Some(lock_ctx) = self.inner_enabled().lock_ctx.as_ref() {
             lock_ctx
                 .cache_lock
-                .trace_lock_wait(&mut span, &read_lock, status);
+                .trace_lock_wait(&mut span, &read_lock, outcome.lock_status());
         }
-        status
+        outcome
     }
 
     /// How long did this request wait behind the read lock
     pub fn lock_duration(&self) -> Option<Duration> {
         self.digest.lock_duration
+    }
+
+    /// An abandoning reader's outcome is deliberately not written to the shared
+    /// lock status: the writer and every other reader are unaffected.
+    fn wait_result(lock: &lock::ReadLock, outcome: WaitOutcome) -> LockWaitOutcome {
+        match outcome {
+            WaitOutcome::Abandoned(matched) => LockWaitOutcome::Abandoned {
+                reason: NoCacheReason::Custom(matched.reason),
+                token: matched.token,
+            },
+            WaitOutcome::Released | WaitOutcome::AgeTimeout => {
+                Self::released_result(lock.lock_status())
+            }
+        }
+    }
+
+    /// A released lock should never still read [`LockStatus::Waiting`]. `Dangling`
+    /// already means "bad state, recompete", and warns, so no panic is needed.
+    fn released_result(status: LockStatus) -> LockWaitOutcome {
+        match status {
+            LockStatus::Done => LockWaitOutcome::Done,
+            LockStatus::TransientError => LockWaitOutcome::TransientError,
+            LockStatus::Dangling => LockWaitOutcome::Dangling,
+            LockStatus::WaitTimeout => LockWaitOutcome::WaitTimeout,
+            LockStatus::AgeTimeout => LockWaitOutcome::AgeTimeout,
+            LockStatus::GiveUp => LockWaitOutcome::GiveUp,
+            LockStatus::Waiting => {
+                debug_assert!(false, "a released lock cannot still be Waiting");
+                LockWaitOutcome::Dangling
+            }
+        }
+    }
+
+    /// The fill this request stopped waiting over, and why it could not use it.
+    ///
+    /// Set only when [`Self::cache_lock_wait`] returned
+    /// [`LockWaitOutcome::Abandoned`]. Absent for every other outcome, including
+    /// [`LockWaitOutcome::GiveUp`], which is the writer giving up rather than this
+    /// request abandoning the wait.
+    pub fn lock_abandon(&self) -> Option<LockAbandon> {
+        self.digest.lock_abandon
     }
 
     /// How long did this request spent on cache lookup and reading the header
@@ -1665,13 +1811,35 @@ impl HttpCache {
     /// # Panic
     /// Need to be called after the cache key is set. Panic otherwise.
     pub async fn purge(&self) -> Result<bool> {
+        self.purge_action(PurgeAction::Delete).await
+    }
+
+    /// Mark the asset stale in the cache storage so the next read revalidates it.
+    ///
+    /// Storage that cannot mark an asset stale deletes it instead, so this never leaves a
+    /// fresh asset behind.
+    ///
+    /// # Panic
+    /// Need to be called after the cache key is set. Panic otherwise.
+    pub async fn expire(&self) -> Result<bool> {
+        self.purge_action(PurgeAction::Expire).await
+    }
+
+    async fn purge_action(&self, action: PurgeAction) -> Result<bool> {
         match self.phase {
             CachePhase::CacheKey => {
                 let inner = self.inner();
                 let inner_enabled = self.inner_enabled();
                 let span = inner_enabled.traces.child("purge");
                 let key = inner.key.as_ref().unwrap().to_compact();
-                Self::purge_impl(inner_enabled.storage, inner_enabled.eviction, &key, span).await
+                Self::purge_impl(
+                    inner_enabled.storage,
+                    inner_enabled.eviction,
+                    &key,
+                    action,
+                    span,
+                )
+                .await
             }
             _ => panic!("wrong phase {:?}", self.phase),
         }
@@ -1695,7 +1863,7 @@ impl HttpCache {
         let storage = inner_enabled.storage;
         let eviction = inner_enabled.eviction;
         tokio::task::spawn(async move {
-            Self::purge_impl(storage, eviction, &key, span)
+            Self::purge_impl(storage, eviction, &key, PurgeAction::Delete, span)
                 .await
                 .map_err(|e| {
                     warn!("Failed to purge {key} (context: {context}): {e}");
@@ -1709,20 +1877,45 @@ impl HttpCache {
         storage: &'static (dyn storage::Storage + Sync),
         eviction: Option<&'static (dyn eviction::EvictionManager + Sync)>,
         key: &CompactCacheKey,
+        action: PurgeAction,
         mut span: Span,
     ) -> Result<bool> {
-        let result = storage
-            .purge(key, PurgeType::Invalidation, &span.handle())
-            .await;
-        let purged = matches!(result, Ok(true));
-        // need to inform eviction manager if asset was removed
-        if let Some(eviction) = eviction.as_ref() {
-            if purged {
-                eviction.remove(key);
+        let target = storage::PurgeTarget::Active(key);
+        let result = match action {
+            PurgeAction::Delete => {
+                storage
+                    .purge(target, PurgeType::Invalidation, &span.handle())
+                    .await
             }
-        }
+            PurgeAction::Expire => storage.expire(target, &span.handle()).await,
+        };
+        let purged = match result.as_ref() {
+            Ok(storage::PurgeOutcome::NotFound) | Err(_) => false,
+            Ok(storage::PurgeOutcome::Purged(entry_id)) => {
+                if let Some(eviction) = eviction {
+                    eviction.remove(target.removed_entry(*entry_id));
+                }
+                true
+            }
+            // the entry is still stored, so the eviction manager keeps tracking it
+            Ok(storage::PurgeOutcome::Expired) => true,
+        };
         span.set_tag(|| trace::Tag::new("purged", purged));
-        result
+        // `purged` alone cannot tell an expiry apart from storage falling back to deleting, so
+        // record what actually happened to the entry.
+        span.set_tag(|| {
+            trace::Tag::new(
+                "purge_outcome",
+                match result.as_ref() {
+                    Ok(storage::PurgeOutcome::NotFound) => "not_found",
+                    Ok(storage::PurgeOutcome::Purged(_)) => "deleted",
+                    Ok(storage::PurgeOutcome::Expired) => "expired",
+                    Err(_) => "error",
+                },
+            )
+        });
+        result?;
+        Ok(purged)
     }
 
     /// Check the cacheable prediction
@@ -1734,6 +1927,17 @@ impl HttpCache {
         } else {
             true
         }
+    }
+
+    /// The reason the predictor remembered for this key when [Self::bypass] ran.
+    ///
+    /// `None` when the cache was not bypassed, when no predictor is configured, or when the
+    /// predictor does not track reasons. Callers must treat `None` as "unknown" rather than
+    /// as evidence about the previous response.
+    pub fn predicted_uncacheable_reason(&self) -> Option<NoCacheReason> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.predicted_uncacheable_reason)
     }
 
     /// Tell the predictor that this response, which is previously predicted to be uncacheable,
@@ -1764,6 +1968,7 @@ impl HttpCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock::{CacheLock, UnusableFill};
     use async_trait::async_trait;
     use http::StatusCode;
     use std::any::Any;
@@ -1771,19 +1976,50 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{LazyLock, Mutex};
 
-    struct UpdateOkStorage;
+    /// Storage fixture with successful metadata updates and configurable purge results.
+    struct UpdateOkStorage {
+        purge_ok: bool,
+    }
+    struct IdentifiedEntryStorage {
+        append: bool,
+    }
     struct OneShotLookupStorage {
         entries: Mutex<Vec<(CompactCacheKey, CacheMeta)>>,
     }
-    struct EmptyHitHandler;
+    /// Storage that can mark an entry stale, recording the target it was asked to expire. Its
+    /// `purge` is unreachable so a test fails loudly if expiry is routed to deletion instead.
+    struct ExpiringStorage {
+        expired: Mutex<Option<CompactCacheKey>>,
+    }
+    struct EmptyHitHandler {
+        entry_id: Option<u64>,
+    }
+    struct IdentifiedMissHandler {
+        finish: MissFinishType,
+    }
     struct CountingDeferPolicy(AtomicUsize);
     struct CountingReadyPolicy(AtomicUsize);
+    #[derive(Default)]
+    struct RecordingEviction {
+        removed: Mutex<Option<eviction::CacheEntryKey>>,
+        accessed: Mutex<Option<eviction::CacheEntryKey>>,
+        admitted: Mutex<Option<eviction::CacheEntryKey>>,
+        incremented: Mutex<Option<(eviction::CacheEntryKey, usize, Option<usize>)>>,
+    }
 
-    static UPDATE_OK_STORAGE: UpdateOkStorage = UpdateOkStorage;
+    static UPDATE_OK_STORAGE: UpdateOkStorage = UpdateOkStorage { purge_ok: false };
+    static PURGE_OK_STORAGE: UpdateOkStorage = UpdateOkStorage { purge_ok: true };
+    static IDENTIFIED_CREATED_STORAGE: IdentifiedEntryStorage =
+        IdentifiedEntryStorage { append: false };
+    static IDENTIFIED_APPENDED_STORAGE: IdentifiedEntryStorage =
+        IdentifiedEntryStorage { append: true };
     // Only one test uses this storage. Keep it that way unless the tests also isolate their keys
     // and clear any entries they push.
     static ONE_SHOT_LOOKUP_STORAGE: OneShotLookupStorage = OneShotLookupStorage {
         entries: Mutex::new(Vec::new()),
+    };
+    static EXPIRING_STORAGE: ExpiringStorage = ExpiringStorage {
+        expired: Mutex::new(None),
     };
     static RAW_MISS_DEFER_POLICY: CountingDeferPolicy = CountingDeferPolicy(AtomicUsize::new(0));
     static VALID_AFTER_DEFER_POLICY: CountingDeferPolicy = CountingDeferPolicy(AtomicUsize::new(0));
@@ -1791,7 +2027,6 @@ mod tests {
     static RAW_MISS_READY_POLICY: CountingReadyPolicy = CountingReadyPolicy(AtomicUsize::new(0));
     static TWO_USE_ADMISSION_POLICY: LazyLock<admission::MinUsesAdmissionPolicy> =
         LazyLock::new(|| admission::MinUsesAdmissionPolicy::new(NonZeroU32::new(2).unwrap()));
-
     impl AdmissionPolicy for CountingDeferPolicy {
         fn observe(&self, _key: &CacheKey) -> Decision {
             self.0.fetch_add(1, Ordering::Relaxed);
@@ -1830,6 +2065,25 @@ mod tests {
         fn as_any_mut(&mut self) -> &mut (dyn Any + Send + Sync) {
             self
         }
+
+        fn entry_id(&self) -> Option<eviction::CacheEntryId> {
+            self.entry_id.map(eviction::CacheEntryId::new)
+        }
+    }
+
+    #[async_trait]
+    impl storage::HandleMiss for IdentifiedMissHandler {
+        async fn write_body(&mut self, _data: bytes::Bytes, _eof: bool) -> Result<()> {
+            Ok(())
+        }
+
+        async fn finish(self: Box<Self>) -> Result<MissFinishType> {
+            Ok(self.finish)
+        }
+
+        fn entry_id(&self) -> Option<eviction::CacheEntryId> {
+            Some(eviction::CacheEntryId::new(7))
+        }
     }
 
     #[async_trait]
@@ -1853,11 +2107,15 @@ mod tests {
 
         async fn purge(
             &'static self,
-            _key: &CompactCacheKey,
+            _target: storage::PurgeTarget<'_>,
             _purge_type: PurgeType,
             _trace: &trace::SpanHandle,
-        ) -> Result<bool> {
-            Ok(false)
+        ) -> Result<storage::PurgeOutcome> {
+            Ok(if self.purge_ok {
+                storage::PurgeOutcome::Purged(None)
+            } else {
+                storage::PurgeOutcome::NotFound
+            })
         }
 
         async fn update_meta(
@@ -1871,6 +2129,176 @@ mod tests {
 
         fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
             self
+        }
+    }
+
+    #[async_trait]
+    impl Storage for ExpiringStorage {
+        async fn lookup(
+            &'static self,
+            _key: &CacheKey,
+            _trace: &trace::SpanHandle,
+        ) -> Result<Option<(CacheMeta, HitHandler)>> {
+            Ok(None)
+        }
+
+        async fn get_miss_handler(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<MissHandler> {
+            unreachable!("tests do not write bodies through this storage")
+        }
+
+        async fn purge(
+            &'static self,
+            _target: storage::PurgeTarget<'_>,
+            _purge_type: PurgeType,
+            _trace: &trace::SpanHandle,
+        ) -> Result<storage::PurgeOutcome> {
+            unreachable!("storage that can expire must not be asked to delete")
+        }
+
+        async fn expire(
+            &'static self,
+            target: storage::PurgeTarget<'_>,
+            _trace: &trace::SpanHandle,
+        ) -> Result<storage::PurgeOutcome> {
+            *self.expired.lock().unwrap() = Some(target.key().clone());
+            Ok(storage::PurgeOutcome::Expired)
+        }
+
+        async fn update_meta(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Storage for IdentifiedEntryStorage {
+        async fn lookup(
+            &'static self,
+            _key: &CacheKey,
+            _trace: &trace::SpanHandle,
+        ) -> Result<Option<(CacheMeta, HitHandler)>> {
+            Ok(None)
+        }
+
+        async fn get_miss_handler(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<MissHandler> {
+            let finish = if self.append {
+                MissFinishType::Appended(2, Some(9))
+            } else {
+                MissFinishType::Created(1)
+            };
+            Ok(Box::new(IdentifiedMissHandler { finish }))
+        }
+
+        async fn purge(
+            &'static self,
+            target: storage::PurgeTarget<'_>,
+            _purge_type: PurgeType,
+            _trace: &trace::SpanHandle,
+        ) -> Result<storage::PurgeOutcome> {
+            let entry_id = match target {
+                storage::PurgeTarget::Active(_) => Some(eviction::CacheEntryId::new(1)),
+                storage::PurgeTarget::Exact(_) => None,
+            };
+            Ok(storage::PurgeOutcome::Purged(entry_id))
+        }
+
+        async fn update_meta(
+            &'static self,
+            _key: &CacheKey,
+            _meta: &CacheMeta,
+            _trace: &trace::SpanHandle,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn as_any(&self) -> &(dyn Any + Send + Sync + 'static) {
+            self
+        }
+    }
+
+    #[async_trait]
+    impl eviction::EvictionManager for RecordingEviction {
+        fn total_size(&self) -> usize {
+            0
+        }
+
+        fn total_items(&self) -> usize {
+            0
+        }
+
+        fn evicted_size(&self) -> usize {
+            0
+        }
+
+        fn evicted_items(&self) -> usize {
+            0
+        }
+
+        fn admit(
+            &self,
+            item: eviction::CacheEntryKey,
+            _size: usize,
+            _fresh_until: SystemTime,
+        ) -> Vec<eviction::CacheEntryKey> {
+            *self.admitted.lock().unwrap() = Some(item);
+            Vec::new()
+        }
+
+        fn increment_weight(
+            &self,
+            item: &eviction::CacheEntryKey,
+            delta: usize,
+            max_weight: Option<usize>,
+        ) -> Vec<eviction::CacheEntryKey> {
+            *self.incremented.lock().unwrap() = Some((item.clone(), delta, max_weight));
+            Vec::new()
+        }
+
+        fn remove(&self, item: eviction::CacheEntryKeyRef<'_>) {
+            *self.removed.lock().unwrap() = Some(eviction::CacheEntryKey::from_entry_id(
+                item.key().clone(),
+                item.entry_id(),
+            ));
+        }
+
+        fn access(
+            &self,
+            item: &eviction::CacheEntryKey,
+            _size: usize,
+            _fresh_until: SystemTime,
+        ) -> bool {
+            *self.accessed.lock().unwrap() = Some(item.clone());
+            true
+        }
+
+        fn peek(&self, _item: &eviction::CacheEntryKey) -> bool {
+            false
+        }
+
+        async fn save(&self, _dir_path: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load(&self, _dir_path: &str) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -1890,7 +2318,7 @@ mod tests {
                 return Ok(None);
             };
             let (_, meta) = entries.remove(pos);
-            Ok(Some((meta, Box::new(EmptyHitHandler))))
+            Ok(Some((meta, Box::new(EmptyHitHandler { entry_id: None }))))
         }
 
         async fn get_miss_handler(
@@ -1904,11 +2332,11 @@ mod tests {
 
         async fn purge(
             &'static self,
-            _key: &CompactCacheKey,
+            _target: storage::PurgeTarget<'_>,
             _purge_type: PurgeType,
             _trace: &trace::SpanHandle,
-        ) -> Result<bool> {
-            Ok(false)
+        ) -> Result<storage::PurgeOutcome> {
+            Ok(storage::PurgeOutcome::NotFound)
         }
 
         async fn update_meta(
@@ -1939,11 +2367,407 @@ mod tests {
         cache
     }
 
+    static FILL_INTEREST_LOCK: LazyLock<CacheLock> =
+        LazyLock::new(|| CacheLock::new(Duration::from_secs(30)));
+
+    const WRONG_PLACE: u64 = 7;
+    const SOMEWHERE_ELSE: u64 = 9;
+
+    /// Reasons are the application's, not the cache's; it wraps them as
+    /// [`NoCacheReason::Custom`].
+    const NO_GOOD: &str = "NoGoodToThisReader";
+    const NO_GOOD_EITHER: &str = "AlsoNoGood";
+
+    fn cannot_use(token: u64) -> UnusableFills {
+        UnusableFills {
+            fills: vec![UnusableFill {
+                token,
+                reason: NO_GOOD,
+            }]
+            .into(),
+        }
+    }
+
+    fn locked_reader(key: &str, interest: Option<UnusableFills>) -> HttpCache {
+        let mut cache_key = CacheKey::new(key, "");
+        if let Some(interest) = interest {
+            cache_key.extensions.insert(interest);
+        }
+        let mut cache = HttpCache::new();
+        cache.enable(
+            &UPDATE_OK_STORAGE,
+            None,
+            None,
+            Some(&*FILL_INTEREST_LOCK),
+            None,
+        );
+        cache.set_cache_key(cache_key);
+        cache
+    }
+
+    /// A reader that stops waiting reports `GiveUp` with its own reason, so the
+    /// give-up is attributed to why it stopped rather than the generic
+    /// `CacheLockGiveUp`.
+    #[tokio::test]
+    async fn a_reader_that_stops_waiting_reports_its_own_reason() {
+        let key = "stops-waiting";
+
+        let mut writer = locked_reader(key, None);
+        assert!(writer.cache_lookup().await.unwrap().is_none());
+        assert!(!writer.is_cache_locked(), "the first request is the writer");
+
+        let mut reader = locked_reader(key, Some(cannot_use(WRONG_PLACE)));
+        assert!(reader.cache_lookup().await.unwrap().is_none());
+        assert!(reader.is_cache_locked(), "the second request coalesces");
+
+        // The writer learns where it is filling from, and says so.
+        let waiting = tokio::spawn(async move {
+            let status = reader.cache_lock_wait().await;
+            (status, reader.lock_abandon())
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "nothing published yet");
+
+        writer.lock_publish_fill_tokens(&[WRONG_PLACE]);
+
+        assert_eq!(
+            waiting.await.unwrap(),
+            (
+                LockWaitOutcome::Abandoned {
+                    reason: NoCacheReason::Custom(NO_GOOD),
+                    token: WRONG_PLACE,
+                },
+                Some(LockAbandon {
+                    reason: NoCacheReason::Custom(NO_GOOD),
+                    token: WRONG_PLACE,
+                })
+            ),
+            "its own reason and token, on the outcome and on the digest alike"
+        );
+
+        // The writer never released, so a reader arriving afterwards without an
+        // interest still coalesces behind it.
+        let mut other = locked_reader(key, None);
+        assert!(other.cache_lookup().await.unwrap().is_none());
+        assert!(other.is_cache_locked(), "the lock is untouched");
+
+        writer.release_write_lock(NoCacheReason::StorageError);
+    }
+
+    /// The reason follows the token that matched, not the set: a key carries one
+    /// [`UnusableFills`], so unrelated parts of an application share it.
+    #[tokio::test]
+    async fn the_reason_comes_from_the_token_that_matched() {
+        let key = "reason-per-token";
+
+        let mut writer = locked_reader(key, None);
+        assert!(writer.cache_lookup().await.unwrap().is_none());
+
+        let interest = UnusableFills {
+            fills: vec![
+                UnusableFill {
+                    token: WRONG_PLACE,
+                    reason: NO_GOOD,
+                },
+                UnusableFill {
+                    token: SOMEWHERE_ELSE,
+                    reason: NO_GOOD_EITHER,
+                },
+            ]
+            .into(),
+        };
+        let mut reader = locked_reader(key, Some(interest));
+        assert!(reader.cache_lookup().await.unwrap().is_none());
+        assert!(reader.is_cache_locked());
+
+        let waiting = tokio::spawn(async move {
+            let status = reader.cache_lock_wait().await;
+            (status, reader.lock_abandon())
+        });
+        tokio::task::yield_now().await;
+
+        // Only the second token is published, so only its reason may surface.
+        writer.lock_publish_fill_tokens(&[SOMEWHERE_ELSE]);
+
+        assert_eq!(
+            waiting.await.unwrap(),
+            (
+                LockWaitOutcome::Abandoned {
+                    reason: NoCacheReason::Custom(NO_GOOD_EITHER),
+                    token: SOMEWHERE_ELSE,
+                },
+                Some(LockAbandon {
+                    reason: NoCacheReason::Custom(NO_GOOD_EITHER),
+                    token: SOMEWHERE_ELSE,
+                })
+            ),
+            "the matched token's own reason, not the first in the set"
+        );
+
+        writer.release_write_lock(NoCacheReason::StorageError);
+    }
+
+    /// A reader whose tokens are never published waits for the writer, as before.
+    #[tokio::test]
+    async fn a_reader_naming_unpublished_tokens_still_waits() {
+        let key = "unpublished-tokens";
+
+        let mut writer = locked_reader(key, None);
+        assert!(writer.cache_lookup().await.unwrap().is_none());
+
+        let mut reader = locked_reader(key, Some(cannot_use(WRONG_PLACE)));
+        assert!(reader.cache_lookup().await.unwrap().is_none());
+        assert!(reader.is_cache_locked());
+
+        let waiting = tokio::spawn(async move { reader.cache_lock_wait().await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "the reader is still coalescing");
+
+        writer.release_write_lock(NoCacheReason::StorageError);
+
+        assert_eq!(waiting.await.unwrap(), LockWaitOutcome::TransientError);
+    }
+
     fn cache_with_lookup_storage(key: CacheKey) -> HttpCache {
         let mut cache = HttpCache::new();
         cache.enable(&ONE_SHOT_LOOKUP_STORAGE, None, None, None, None);
         cache.set_cache_key(key);
         cache
+    }
+
+    #[tokio::test]
+    async fn purge_removes_identified_entry() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("expanded-purge", "").to_compact();
+
+        assert!(HttpCache::purge_impl(
+            &IDENTIFIED_CREATED_STORAGE,
+            Some(recording),
+            &key,
+            PurgeAction::Delete,
+            trace::Span::inactive(),
+        )
+        .await
+        .unwrap());
+
+        let removed = recording
+            .removed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("purge should remove the identified entry");
+        assert_eq!(
+            removed,
+            eviction::CacheEntryKey::identified(key, eviction::CacheEntryId::new(1))
+        );
+        assert!(recording.accessed.lock().unwrap().is_none());
+        assert!(recording.admitted.lock().unwrap().is_none());
+        assert!(recording.incremented.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn purge_removes_key_only_entry() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("key-only-purge", "").to_compact();
+
+        assert!(HttpCache::purge_impl(
+            &PURGE_OK_STORAGE,
+            Some(recording),
+            &key,
+            PurgeAction::Delete,
+            trace::Span::inactive(),
+        )
+        .await
+        .unwrap());
+
+        let removed = recording
+            .removed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("purge should remove the key-only entry");
+        assert_eq!(removed, eviction::CacheEntryKey::key_only(key));
+    }
+
+    #[tokio::test]
+    async fn expiring_an_entry_keeps_it_tracked_by_eviction() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("expire-keeps-entry", "").to_compact();
+
+        assert!(HttpCache::purge_impl(
+            &EXPIRING_STORAGE,
+            Some(recording),
+            &key,
+            PurgeAction::Expire,
+            trace::Span::inactive(),
+        )
+        .await
+        .unwrap());
+
+        assert_eq!(
+            EXPIRING_STORAGE.expired.lock().unwrap().take(),
+            Some(key),
+            "storage should have been asked to expire the target"
+        );
+        assert!(
+            recording.removed.lock().unwrap().is_none(),
+            "the entry is still stored, so eviction must keep tracking it"
+        );
+    }
+
+    #[tokio::test]
+    async fn expiring_falls_back_to_deleting_when_storage_cannot_mark_stale() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("expire-falls-back", "").to_compact();
+
+        assert!(HttpCache::purge_impl(
+            &PURGE_OK_STORAGE,
+            Some(recording),
+            &key,
+            PurgeAction::Expire,
+            trace::Span::inactive(),
+        )
+        .await
+        .unwrap());
+
+        let removed = recording
+            .removed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the fallback deletes, so eviction must stop tracking the entry");
+        assert_eq!(removed, eviction::CacheEntryKey::key_only(key));
+    }
+
+    #[tokio::test]
+    async fn the_expire_fallback_reports_nothing_purged_for_an_absent_entry() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("expire-absent", "").to_compact();
+
+        assert!(!HttpCache::purge_impl(
+            &UPDATE_OK_STORAGE,
+            Some(recording),
+            &key,
+            PurgeAction::Expire,
+            trace::Span::inactive(),
+        )
+        .await
+        .unwrap());
+
+        assert!(recording.removed.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_hit_passes_entry_id_to_eviction() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("identified-hit", "");
+        let mut cache = HttpCache::new();
+        cache.enable(
+            &IDENTIFIED_CREATED_STORAGE,
+            Some(recording),
+            None,
+            None,
+            None,
+        );
+        cache.set_cache_key(key.clone());
+        cache.cache_found(
+            test_meta(SystemTime::now()),
+            Box::new(EmptyHitHandler { entry_id: Some(7) }),
+            HitStatus::Fresh,
+        );
+
+        assert_eq!(
+            recording.accessed.lock().unwrap().take(),
+            Some(eviction::CacheEntryKey::identified(
+                key.to_compact(),
+                eviction::CacheEntryId::new(7)
+            ))
+        );
+        assert!(recording.removed.lock().unwrap().is_none());
+        assert!(recording.admitted.lock().unwrap().is_none());
+        assert!(recording.incremented.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_forced_expiry_that_serves_stale_is_stale_with_its_windows_intact() {
+        let mut cache = HttpCache::new();
+        cache.enable(&IDENTIFIED_CREATED_STORAGE, None, None, None, None);
+        cache.set_cache_key(CacheKey::new("force-expired-serve-stale", ""));
+        cache.cache_found(
+            test_meta(SystemTime::now()),
+            Box::new(EmptyHitHandler { entry_id: None }),
+            HitStatus::ForceExpiredServeStale,
+        );
+
+        assert_eq!(cache.phase(), CachePhase::Stale);
+        assert_eq!(cache.cache_meta().stale_while_revalidate_sec(), 30);
+        assert_eq!(cache.cache_meta().stale_if_error_sec(), 30);
+    }
+
+    #[test]
+    fn a_forced_expiry_that_serves_stale_is_neither_fresh_nor_a_miss() {
+        let status = HitStatus::ForceExpiredServeStale;
+
+        assert!(!status.is_fresh());
+        assert!(!status.is_treated_as_miss());
+        assert_eq!(status.as_str(), "force_expired_serve_stale");
+    }
+
+    #[tokio::test]
+    async fn cache_miss_passes_entry_id_to_eviction() {
+        let recording = Box::leak(Box::new(RecordingEviction::default()));
+        let key = CacheKey::new("identified-miss", "");
+        let mut cache = HttpCache::new();
+        cache.enable(
+            &IDENTIFIED_CREATED_STORAGE,
+            Some(recording),
+            None,
+            None,
+            None,
+        );
+        cache.set_cache_key(key.clone());
+        cache.cache_miss();
+        cache.set_cache_meta(test_meta(SystemTime::now()));
+        cache.set_miss_handler().await.unwrap();
+        cache.finish_miss_handler().await.unwrap();
+        assert_eq!(
+            recording.admitted.lock().unwrap().take(),
+            Some(eviction::CacheEntryKey::identified(
+                key.to_compact(),
+                eviction::CacheEntryId::new(7)
+            ))
+        );
+        assert!(recording.incremented.lock().unwrap().is_none());
+        assert!(recording.removed.lock().unwrap().is_none());
+        assert!(recording.accessed.lock().unwrap().is_none());
+
+        let mut cache = HttpCache::new();
+        cache.enable(
+            &IDENTIFIED_APPENDED_STORAGE,
+            Some(recording),
+            None,
+            None,
+            None,
+        );
+        cache.set_cache_key(key.clone());
+        cache.cache_miss();
+        cache.set_cache_meta(test_meta(SystemTime::now()));
+        cache.set_miss_handler().await.unwrap();
+        cache.finish_miss_handler().await.unwrap();
+        assert_eq!(
+            recording.incremented.lock().unwrap().take(),
+            Some((
+                eviction::CacheEntryKey::identified(
+                    key.to_compact(),
+                    eviction::CacheEntryId::new(7)
+                ),
+                2,
+                Some(9)
+            ))
+        );
+        assert!(recording.admitted.lock().unwrap().is_none());
+        assert!(recording.removed.lock().unwrap().is_none());
+        assert!(recording.accessed.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2085,6 +2909,30 @@ mod tests {
         assert_eq!(cache.cache_meta().created(), created);
         assert_eq!(cache.cache_meta().updated(), revalidated_at);
         assert_eq!(cache.cache_meta().provenance(), family_start);
+    }
+
+    #[tokio::test]
+    async fn revalidating_an_expired_meta_makes_it_fresh_again() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let expired_at = created + Duration::from_secs(30);
+        let revalidated_at = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+
+        // An expiry has to be undone by revalidation, or a soft purge would leave the asset
+        // stale forever. It comes back because revalidation replaces the whole meta rather than
+        // merging into the expired one.
+        let mut old_meta = test_meta(created);
+        old_meta.expire_at(expired_at);
+        assert!(!old_meta.is_fresh(expired_at + Duration::from_secs(1)));
+
+        let mut cache = cache_with_stale_meta(old_meta, CacheKey::new("revalidate-expired", ""));
+        cache
+            .revalidate_cache_meta(test_meta(revalidated_at))
+            .await
+            .unwrap();
+
+        let meta = cache.cache_meta();
+        assert!(meta.is_fresh(revalidated_at));
+        assert_eq!(meta.fresh_until(), revalidated_at + Duration::from_secs(60));
     }
 
     #[test]
