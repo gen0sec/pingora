@@ -184,6 +184,11 @@ where
         }
 
         session.set_upstream_connect_request(req.method == http::Method::CONNECT);
+        // Only a peer that opted in may turn a proxied CONNECT into a tunnel.
+        let connect_tunnel = req.method == http::Method::CONNECT && peer.options.connect_tunnel;
+        session
+            .downstream_session
+            .set_connect_tunnel_allowed(connect_tunnel);
 
         if authority_policy.is_standard() {
             if let Err(e) = reconcile_upstream_authority(&mut req) {
@@ -232,7 +237,7 @@ where
         session.upstream_compression.request_filter(&req);
         // A CONNECT stream carries the tunnel after a 2xx, so it must not be ended up front even
         // though the request has no content (an h1 CONNECT has no body at all).
-        let body_empty = req.method != http::Method::CONNECT && session.as_mut().is_body_empty();
+        let body_empty = !connect_tunnel && session.as_mut().is_body_empty();
 
         // whether we support sending END_STREAM on HEADERS if body is empty
         let send_end_stream = req.send_end_stream().expect("req must be h2");
@@ -575,7 +580,8 @@ where
             let support_cache_partial_read =
                 session.cache.support_streaming_partial_write() == Some(true);
             let upgraded = session.was_upgraded();
-            let is_connect = session.req_header().method == http::Method::CONNECT;
+            // whether this CONNECT may become a tunnel
+            let is_connect = session.downstream_session.connect_tunnel_allowed();
             // Data a CONNECT client sends before the tunnel is established (an h2 client may
             // send DATA early) is not a request body. Leave it unread until a 2xx establishes
             // the tunnel. An h1 CONNECT has no body, so it keeps idling as usual.
@@ -616,6 +622,14 @@ where
                            }
                         }
                     };
+                    // Where the client cannot half-close its side of a tunnel (h1 over TLS before
+                    // 1.3), its end of the tunnel ends the whole exchange.
+                    if body.is_none()
+                        && session.was_upgraded()
+                        && !session.downstream_session.tunnel_supports_half_close()
+                    {
+                        response_state.maybe_set_upstream_done(true);
+                    }
                     let is_body_done = session.is_body_done();
                     match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
                         Ok(request_done) =>  {
@@ -992,7 +1006,7 @@ where
                 // (a 2xx to CONNECT turns the connection into a tunnel instead)
                 let no_body = session.req_header().method == "HEAD"
                     || matches!(header.status.as_u16(), 204 | 304)
-                    || (session.req_header().method == Method::CONNECT
+                    || (session.downstream_session.connect_tunnel_allowed()
                         && header.status.is_success());
 
                 /* Add chunked header to tell downstream to use chunked encoding
@@ -1079,7 +1093,7 @@ where
     /// once a 2xx establishes the tunnel, resume reading the downstream (an h1 CONNECT had no
     /// body until then), and once a refusal completes, stop waiting on the data held back.
     fn update_connect_downstream_state(
-        session: &Session<DS>,
+        session: &mut Session<DS>,
         is_connect: bool,
         was_upgraded: bool,
         response_done: bool,
@@ -1093,6 +1107,9 @@ where
                 trace!("reset downstream state on CONNECT tunnel");
                 downstream_state.reset();
             }
+            // where the client cannot half-close, the end of the upstream side also closed the
+            // client's side
+            downstream_state.maybe_finished(response_done && session.is_body_done());
         } else {
             downstream_state.maybe_finished(response_done);
         }

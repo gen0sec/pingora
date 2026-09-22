@@ -218,6 +218,26 @@ pub fn is_connect_tunnel_resp(method: &http::Method, header: &ResponseHeader) ->
     method == http::Method::CONNECT && header.status.is_success()
 }
 
+/// Whether a tunnel over `stream` can be half-closed: one side signals the end of its bytes
+/// while still reading the other side's.
+///
+/// TCP allows it, and so does TLS 1.3 (<https://www.rfc-editor.org/rfc/rfc8446#section-6.1>).
+/// Before TLS 1.3 the peer must answer a close_notify by closing the whole connection and
+/// discarding pending writes (<https://www.rfc-editor.org/rfc/rfc5246#section-7.2.1>), so
+/// ending one side there ends the tunnel.
+pub(crate) fn supports_tunnel_half_close(stream: &crate::protocols::Stream) -> bool {
+    match stream.get_ssl_digest() {
+        None => true,
+        Some(digest) => is_tls13_version(&digest.version),
+    }
+}
+
+/// Whether a TLS version string, as the TLS backends name it ("TLSv1.3", "TLSv1_3"), is
+/// TLS 1.3.
+fn is_tls13_version(version: &str) -> bool {
+    matches!(version, "TLSv1.3" | "TLSv1_3" | "TLS1.3" | "TLS1_3")
+}
+
 #[inline]
 pub fn header_value_content_length(
     header_value: Option<&http::header::HeaderValue>,
@@ -446,6 +466,16 @@ pub(crate) fn content_length_is_single_token(headers: &HMap) -> bool {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn tls13_version_names() {
+        for version in ["TLSv1.3", "TLSv1_3"] {
+            assert!(is_tls13_version(version), "{version}");
+        }
+        for version in ["TLSv1.2", "TLSv1_2", "TLSv1", "TLSv1.1", "unknown", ""] {
+            assert!(!is_tls13_version(version), "{version}");
+        }
+    }
     use http::{
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
         StatusCode, Version,

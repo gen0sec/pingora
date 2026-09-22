@@ -72,6 +72,12 @@ pub struct HttpServerOptions {
     /// Allow proxying CONNECT requests when handling HTTP traffic.
     ///
     /// When disabled, CONNECT requests are rejected with 405 by proxy services.
+    ///
+    /// When enabled, a CONNECT is proxied like any other request, and a 2xx response to it is
+    /// an ordinary response: no tunnel is created. A tunnel requires the upstream peer to opt
+    /// in with [`PeerOptions::connect_tunnel`](crate::upstreams::peer::PeerOptions::connect_tunnel).
+    /// Once a 2xx from such a peer establishes the tunnel, everything the client sends reaches
+    /// the peer as-is, without any request processing, so only opt in peers known to tunnel.
     pub allow_connect_method_proxying: bool,
 
     #[doc(hidden)]

@@ -439,6 +439,11 @@ impl ProxyHttp for ExampleProxyHttp {
             peer.options.set_http_version(2, 2);
         }
 
+        if session.get_header_bytes("x-connect-tunnel") == b"true" {
+            // the test origin is known to tunnel a CONNECT it answers with 2xx
+            peer.options.connect_tunnel = true;
+        }
+
         if req
             .headers
             .contains_key("x-preserve-upstream-request-headers")
@@ -1052,6 +1057,14 @@ fn test_main() {
     http_server_options.h2c = true;
     http_logic.server_options = Some(http_server_options);
     proxy_service_http_connect.add_tcp("0.0.0.0:6160");
+    #[cfg(feature = "any_tls")]
+    {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let tls_settings =
+            pingora_core::listeners::tls::TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        proxy_service_http_connect.add_tls_with_settings("0.0.0.0:6161", None, tls_settings);
+    }
 
     let mut proxy_service_h2c =
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
