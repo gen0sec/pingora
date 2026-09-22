@@ -116,6 +116,8 @@ pub struct HttpSession {
     /// Whether this session is an upgraded session. This flag is calculated when sending the
     /// response header to the client.
     upgraded: bool,
+    // Whether a 2xx response to a CONNECT may turn the connection into a tunnel.
+    connect_tunnel_allowed: bool,
     /// Digest to track underlying connection metrics
     digest: Box<Digest>,
     /// Minimum send rate to the client
@@ -195,6 +197,7 @@ impl HttpSession {
             body_bytes_read: 0,
             retry_buffer: None,
             upgraded: false,
+            connect_tunnel_allowed: false,
             digest,
             min_send_rate: None,
             ignore_info_resp: false,
@@ -689,14 +692,38 @@ impl HttpSession {
         self.get_method() == Some(&Method::CONNECT)
     }
 
+    /// Allow a 2xx response to this CONNECT request to turn the connection into a tunnel.
+    ///
+    /// Off by default: a 2xx response to CONNECT is then framed as an ordinary response, and
+    /// nothing the client sends afterwards is passed through. Only allow it once something is
+    /// ready to carry the tunnel. Once the response is written, every byte the client sends is
+    /// handed on as opaque tunnel data, with no HTTP processing.
+    pub fn set_connect_tunnel_allowed(&mut self, allowed: bool) {
+        self.connect_tunnel_allowed = allowed;
+    }
+
+    /// Whether a 2xx response to this request turns the connection into a tunnel, see
+    /// [`Self::set_connect_tunnel_allowed()`].
+    pub fn connect_tunnel_allowed(&self) -> bool {
+        self.connect_tunnel_allowed && self.is_connect_req()
+    }
+
+    /// Whether a tunnel over this connection can be half-closed: the client can end its side
+    /// while still receiving the other. True over TCP and TLS 1.3. Before TLS 1.3, ending
+    /// either side (a close_notify) ends the whole connection.
+    pub fn tunnel_supports_half_close(&self) -> bool {
+        supports_tunnel_half_close(&self.underlying_stream)
+    }
+
     /// `Some(true)` if the this is a successful upgrade
     /// `Some(false)` if the request is an upgrade but the response refuses it
     /// `None` if the request is not an upgrade.
     ///
-    /// A CONNECT request counts as an upgrade request, and any 2xx response to it as the
-    /// successful upgrade that turns the connection into a tunnel.
+    /// When [tunnelling](Self::set_connect_tunnel_allowed) is allowed, a CONNECT is treated as
+    /// an upgrade here, and any 2xx response to it as the successful upgrade that turns the
+    /// connection into a tunnel. [`Self::is_upgrade_req()`] does not report CONNECT.
     pub fn is_upgrade(&self, header: &ResponseHeader) -> Option<bool> {
-        if self.is_connect_req() {
+        if self.connect_tunnel_allowed() {
             Some(is_connect_tunnel_resp(&Method::CONNECT, header))
         } else if self.is_upgrade_req() {
             Some(is_upgrade_resp(header))
@@ -709,7 +736,8 @@ impl HttpSession {
     ///
     /// Either the request had to have been an `Upgrade` request
     /// and the response had to have been a `101 Switching Protocols`,
-    /// or the request had to have been a CONNECT and the response a 2xx.
+    /// or the request had to have been a CONNECT allowed to
+    /// [tunnel](Self::set_connect_tunnel_allowed) and the response a 2xx.
     pub fn was_upgraded(&self) -> bool {
         self.upgraded
     }
@@ -857,7 +885,11 @@ impl HttpSession {
         }
 
         let connect_tunnel =
-            self.is_connect_req() && is_connect_tunnel_resp(&Method::CONNECT, header);
+            self.connect_tunnel_allowed() && is_connect_tunnel_resp(&Method::CONNECT, header);
+        if self.is_connect_req() && !connect_tunnel && !header.status.is_informational() {
+            // Early bytes stay in the preread body until the reader is initialized.
+            self.init_body_reader();
+        }
         if connect_tunnel {
             // A 2xx response to CONNECT has no content, and the connection carries the tunnel
             // until closed, so it can never be reused.
@@ -866,11 +898,10 @@ impl HttpSession {
             header.remove_header(&header::TRANSFER_ENCODING);
             header.remove_header(&header::CONNECTION);
             self.set_keepalive(None);
-        } else if self.is_connect_req() && !header.status.is_informational() && {
-            // Early bytes stay in the preread body until the reader is initialized.
-            self.init_body_reader();
-            self.body_reader.has_bytes_overread()
-        } {
+        } else if self.is_connect_req()
+            && !header.status.is_informational()
+            && self.body_reader.has_bytes_overread()
+        {
             // The client sent tunnel bytes before learning whether the tunnel would be
             // established. They are not an HTTP request, so the connection cannot be reused.
             self.set_keepalive(None);
@@ -964,7 +995,7 @@ impl HttpSession {
     fn init_body_writer(&mut self, header: &ResponseHeader) {
         use http::StatusCode;
         // A 2xx to CONNECT (204 included) makes the rest of the connection a tunnel.
-        if self.is_connect_req() && is_connect_tunnel_resp(&Method::CONNECT, header) {
+        if self.connect_tunnel_allowed() && is_connect_tunnel_resp(&Method::CONNECT, header) {
             self.body_writer.init_close_delimited();
             return;
         }
@@ -1114,13 +1145,14 @@ impl HttpSession {
 
     /// Whether a 2xx response turned this CONNECT into a tunnel.
     fn is_connect_tunnel(&self) -> bool {
-        self.upgraded && self.is_connect_req()
+        self.upgraded && self.connect_tunnel_allowed()
     }
 
     fn maybe_force_close_body_reader(&mut self) {
-        // A CONNECT tunnel half-closes instead: the client may still be sending after the
-        // upstream finished.
-        if self.upgraded && !self.is_connect_tunnel() && !self.body_reader.body_done() {
+        // A CONNECT tunnel half-closes instead where the transport allows it: the client may
+        // still be sending after the upstream finished.
+        let half_close = self.is_connect_tunnel() && self.tunnel_supports_half_close();
+        if self.upgraded && !half_close && !self.body_reader.body_done() {
             // response is done, reset the request body to close
             self.body_reader.init_content_length(0, b"");
         }
@@ -1149,8 +1181,8 @@ impl HttpSession {
         Ok(res)
     }
 
-    /// Half-close a CONNECT tunnel: signal the end of the tunnel bytes to the client (a TCP FIN)
-    /// while still reading what the client sends.
+    /// Signal the end of a CONNECT tunnel's bytes to the client (a TCP FIN, or a TLS
+    /// close_notify). Where the transport allows it, the client's side of the tunnel stays open.
     async fn shutdown_tunnel_write(&mut self) -> Result<()> {
         trace!("shutting down write side of CONNECT tunnel");
         self.underlying_stream
@@ -1327,7 +1359,7 @@ impl HttpSession {
             // bytes (not FIN) arrived on the idle poll.
             // The same holds for CONNECT bytes stashed before the response below.
             if self.pipelined_idle_bytes_stashed
-                && (self.pipelining_enabled || self.is_connect_req())
+                && (self.pipelining_enabled || self.connect_tunnel_allowed())
             {
                 return std::future::pending().await;
             }
@@ -1353,7 +1385,7 @@ impl HttpSession {
                     // will fail.
                     std::future::pending().await
                 }
-            } else if self.is_connect_req() && self.response_written.is_none() {
+            } else if self.connect_tunnel_allowed() && self.response_written.is_none() {
                 // A CONNECT client may send tunnel bytes before the response arrives
                 // (e.g. a TLS ClientHello right behind the request). Stash them on the body
                 // reader's overread surface: a 2xx response converts the reader to
@@ -3102,6 +3134,7 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.update_resp_headers = false;
         http_stream.read_request().await.unwrap();
+        http_stream.set_connect_tunnel_allowed(true);
         assert!(http_stream.is_connect_req());
         // a CONNECT request has no body before the tunnel is established
         assert!(http_stream.is_body_done());
@@ -3140,6 +3173,7 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.update_resp_headers = false;
         http_stream.read_request().await.unwrap();
+        http_stream.set_connect_tunnel_allowed(true);
         let mut response = ResponseHeader::build(200, None).unwrap();
         response.insert_header("Connection", "keep-alive").unwrap();
         http_stream
@@ -3161,6 +3195,7 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.update_resp_headers = false;
         http_stream.read_request().await.unwrap();
+        http_stream.set_connect_tunnel_allowed(true);
         assert!(http_stream.is_body_done());
 
         let response = ResponseHeader::build(200, None).unwrap();
@@ -3183,6 +3218,7 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.update_resp_headers = false;
         http_stream.read_request().await.unwrap();
+        http_stream.set_connect_tunnel_allowed(true);
 
         // early tunnel bytes are held back instead of failing as "data after end of body"
         let idle = tokio::time::timeout(
@@ -3230,6 +3266,7 @@ mod tests_stream {
         http_stream.close_on_response_before_downstream_finish =
             close_on_response_before_downstream_finish;
         http_stream.read_request().await.unwrap();
+        http_stream.set_connect_tunnel_allowed(true);
         http_stream.set_keepalive(Some(0));
 
         let mut response = ResponseHeader::build(407, Some(1)).unwrap();
@@ -3242,6 +3279,38 @@ mod tests_stream {
         assert!(!http_stream.was_upgraded());
         // tunnel bytes sent ahead of a refusal are not a pipelined request
         assert_eq!(!early_bytes, http_stream.will_keepalive());
+    }
+
+    #[tokio::test]
+    async fn connect_2xx_without_tunnel_allowed_is_a_normal_response() {
+        init_log();
+        // Unless tunnelling is allowed, a 2xx to CONNECT is framed as any other response and
+        // nothing the client sends afterwards is passed through.
+        let mock_io = Builder::new()
+            .read(CONNECT_REQ)
+            .write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+            .write(b"ok")
+            // the idle probe reads a single byte
+            .read(b"G")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+        assert!(!http_stream.connect_tunnel_allowed());
+
+        let mut response = ResponseHeader::build(200, Some(1)).unwrap();
+        response.insert_header("Content-Length", "2").unwrap();
+        assert_eq!(None, http_stream.is_upgrade(&response));
+        http_stream
+            .write_response_header(Box::new(response))
+            .await
+            .unwrap();
+        http_stream.write_body(b"ok").await.unwrap();
+        assert!(!http_stream.was_upgraded());
+        assert!(http_stream.is_body_done());
+        // bytes after the request are not tunnel bytes
+        let err = http_stream.read_body_or_idle(true).await.unwrap_err();
+        assert_eq!(err.etype(), &ConnectError);
     }
 
     #[test]

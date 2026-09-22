@@ -543,6 +543,15 @@ pub struct PeerOptions {
     pub allow_h1_response_invalid_content_length: bool,
     /// Controls automatically forwarded request headers sent to HTTP upstreams.
     pub http_upstream_request_policy: HttpUpstreamRequestPolicy,
+    /// Let a 2xx response from this peer to a proxied CONNECT turn the exchange into a tunnel.
+    ///
+    /// Defaults to false: a 2xx response to CONNECT is then proxied as an ordinary response and
+    /// no tunnel is created. Only enable it for peers known to establish a tunnel on a 2xx
+    /// response (e.g. another forward proxy). Every byte the client sends through the tunnel
+    /// reaches the peer as-is, without passing through any request processing, so a peer that
+    /// answers 2xx without tunnelling (such as a catch-all HTTP server) would receive the
+    /// client's raw input, e.g. requests the proxy never saw.
+    pub connect_tunnel: bool,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
     /// The list of curves the tls connection should advertise
     /// if `None`, the default curves will be used
@@ -600,6 +609,7 @@ impl PeerOptions {
             h2_stream_window_size: None,
             h2_connection_window_size: None,
             allow_h1_response_invalid_content_length: false,
+            connect_tunnel: false,
             http_upstream_request_policy: HttpUpstreamRequestPolicy::default(),
             extra_proxy_headers: BTreeMap::new(),
             curves: None,

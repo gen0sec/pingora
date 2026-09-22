@@ -840,8 +840,9 @@ where
     ///
     /// Returns `Some(true)` when an upgrade request gets an upgrade response,
     /// `Some(false)` when an upgrade request gets a non-upgrade response, and
-    /// `None` when this request is not an upgrade. A CONNECT request counts as an upgrade
-    /// request, and any 2xx response to it as the upgrade response.
+    /// `None` when this request is not an upgrade. A CONNECT allowed to
+    /// [tunnel](Self::set_connect_tunnel_allowed) is treated as an upgrade here, and any 2xx
+    /// response to it as the upgrade response; [`Self::is_upgrade_req()`] does not report it.
     pub fn is_upgrade(&self, header: &ResponseHeader) -> Option<bool> {
         match self {
             Self::H1(s) => s.is_upgrade(header),
@@ -854,6 +855,46 @@ where
                     None
                 }
             }
+        }
+    }
+
+    /// Allow a 2xx response to this CONNECT request to turn the session into a tunnel.
+    ///
+    /// Off by default: a 2xx response to CONNECT is then framed as an ordinary response, and
+    /// nothing the client sends afterwards is passed through. Only allow it once something is
+    /// ready to carry the tunnel. Once the response is written, everything the client sends is
+    /// handed on as opaque tunnel data, with no HTTP processing.
+    ///
+    /// Only HTTP/1 and HTTP/2 sessions support tunnels; this is a no-op for other sessions.
+    pub fn set_connect_tunnel_allowed(&mut self, allowed: bool) {
+        match self {
+            Self::H1(s) => s.set_connect_tunnel_allowed(allowed),
+            Self::H2(s) => s.set_connect_tunnel_allowed(allowed),
+            Self::Subrequest(_) | Self::Custom(_) => {}
+        }
+    }
+
+    /// Whether a 2xx response to this request turns the session into a tunnel, see
+    /// [`Self::set_connect_tunnel_allowed()`].
+    pub fn connect_tunnel_allowed(&self) -> bool {
+        match self {
+            Self::H1(s) => s.connect_tunnel_allowed(),
+            Self::H2(s) => s.connect_tunnel_allowed(),
+            Self::Subrequest(_) | Self::Custom(_) => false,
+        }
+    }
+
+    /// Whether a tunnel over this session can be half-closed: the client can end its side while
+    /// still receiving the other.
+    ///
+    /// An HTTP/2 stream always can (END_STREAM ends one direction). An HTTP/1 connection can
+    /// over TCP and TLS 1.3; before TLS 1.3, ending either side (a close_notify) ends the whole
+    /// connection.
+    pub fn tunnel_supports_half_close(&self) -> bool {
+        match self {
+            Self::H1(s) => s.tunnel_supports_half_close(),
+            Self::H2(_) => true,
+            Self::Subrequest(_) | Self::Custom(_) => false,
         }
     }
 

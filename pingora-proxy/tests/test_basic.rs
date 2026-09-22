@@ -852,8 +852,8 @@ async fn test_connect_proxying_allowed_h1() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = listener.local_addr().unwrap();
 
-    // Per RFC 9110 §9.3.6 a 2xx response to CONNECT has no content: the origin's
-    // Content-Length is ignored and the bytes after the header are tunnel bytes.
+    // Note per RFC CONNECT 2xx responses are not allowed to have response
+    // bodies, so this is non-standard behavior.
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buf = [0u8; 1024];
@@ -870,9 +870,12 @@ async fn test_connect_proxying_allowed_h1() {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    let mut buf = vec![];
-    stream.read_to_end(&mut buf).await.unwrap();
-    assert_connect_tunnel_response(&buf, b"ok");
+    let mut buf = vec![0u8; 1024];
+    let read = stream.read(&mut buf).await.unwrap();
+    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let status_line = resp.lines().next().unwrap_or("");
+    assert!(status_line.contains(" 200 "));
+    assert!(resp.ends_with("ok"));
 }
 
 #[tokio::test]
@@ -900,9 +903,74 @@ async fn test_connect_proxying_allowed_h1_without_host() {
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    let mut buf = vec![];
-    stream.read_to_end(&mut buf).await.unwrap();
-    assert_connect_tunnel_response(&buf, b"ok");
+    let mut buf = vec![0u8; 1024];
+    let read = stream.read(&mut buf).await.unwrap();
+    let resp = std::str::from_utf8(&buf[..read]).unwrap();
+    let status_line = resp.lines().next().unwrap_or("");
+    assert!(status_line.contains(" 200 "));
+    assert!(resp.ends_with("ok"));
+}
+
+#[tokio::test]
+async fn test_connect_proxying_no_tunnel_to_peer_that_did_not_opt_in() {
+    init();
+
+    // A catch-all origin: it answers 200 to anything, including a CONNECT, without tunnelling.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut received = vec![];
+        let mut buf = [0u8; 1024];
+        let mut responded = false;
+        loop {
+            let read =
+                tokio::time::timeout(std::time::Duration::from_millis(500), socket.read(&mut buf))
+                    .await;
+            match read {
+                Ok(Ok(n)) if n > 0 => received.extend_from_slice(&buf[..n]),
+                _ => break,
+            }
+            if !responded && received.windows(4).any(|w| w == b"\r\n\r\n") {
+                responded = true;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        }
+        let _ = received_tx.send(received);
+    });
+
+    // The peer is not marked as a tunnel destination (no X-Connect-Tunnel).
+    let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
+    let request = format!(
+        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {}\r\n\r\n",
+        upstream_addr.port()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut resp = vec![];
+    read_until_suffix(&mut stream, &mut resp, b"\r\n\r\n").await;
+    assert!(resp.starts_with(b"HTTP/1.1 200 "), "{resp:?}");
+
+    // Bytes after the 2xx must not reach the origin as a request the proxy never processed.
+    let _ = stream
+        .write_all(b"GET /admin HTTP/1.1\r\nHost: internal\r\n\r\n")
+        .await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.read_to_end(&mut resp),
+    )
+    .await;
+
+    let received = received_rx.await.unwrap();
+    let received = String::from_utf8_lossy(&received);
+    assert!(
+        received.starts_with("CONNECT pingora.org:443 HTTP/1.1\r\n"),
+        "{received}"
+    );
+    assert!(!received.contains("/admin"), "{received}");
 }
 
 /// Spawn an h1 origin that accepts one CONNECT, echoes the tunnel, and once the client
@@ -937,8 +1005,9 @@ async fn spawn_h1_connect_origin() -> (u16, tokio::sync::oneshot::Receiver<Vec<u
             }
             socket.write_all(&buf[..n]).await.unwrap();
         }
-        // the client half-closed: the tunnel still carries the rest of our side
-        socket.write_all(b"bye").await.unwrap();
+        // the client half-closed: the tunnel still carries the rest of our side (unless the
+        // transport could not half-close, and the proxy closed the whole tunnel)
+        let _ = socket.write_all(b"bye").await;
         let _ = socket.shutdown().await;
     });
     (port, header_rx)
@@ -977,7 +1046,7 @@ async fn h1_connect_tunnel(upstream_port: u16, upstream_h2: bool) {
     let mut stream = TcpStream::connect("127.0.0.1:6160").await.unwrap();
     // "early" is sent before the client has seen the response
     let request = format!(
-        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {upstream_port}\r\nX-H2: {upstream_h2}\r\n\r\nearly"
+        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {upstream_port}\r\nX-H2: {upstream_h2}\r\nX-Connect-Tunnel: true\r\n\r\nearly"
     );
     stream.write_all(request.as_bytes()).await.unwrap();
 
@@ -1006,6 +1075,7 @@ async fn h2_connect_tunnel(upstream_port: u16, upstream_h2: bool) {
         .uri("http://pingora.org:443/")
         .header("x-port", upstream_port.to_string())
         .header("x-h2", upstream_h2.to_string())
+        .header("x-connect-tunnel", "true")
         .body(())
         .unwrap();
     let (response, mut send) = h2.send_request(request, false).unwrap();
@@ -1041,6 +1111,96 @@ async fn with_tunnel_timeout(tunnel: impl std::future::Future<Output = ()>) {
     tokio::time::timeout(std::time::Duration::from_secs(10), tunnel)
         .await
         .expect("tunnel stalled");
+}
+
+/// Run a tunnel through the CONNECT proxy's TLS listener from an h1 client limited to
+/// `max_version`: send `early` along with the request, echo `ping`, send close_notify, and
+/// return every tunnel byte received after the response header.
+#[cfg(feature = "openssl")]
+async fn h1_tls_connect_tunnel(
+    upstream_port: u16,
+    max_version: pingora_core::tls::ssl::SslVersion,
+) -> Vec<u8> {
+    use pingora_core::tls::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    use pingora_core::tls::tokio_ssl::SslStream;
+    use std::pin::Pin;
+
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_verify(SslVerifyMode::NONE);
+    connector.set_max_proto_version(Some(max_version)).unwrap();
+    let ssl = connector
+        .build()
+        .configure()
+        .unwrap()
+        .verify_hostname(false)
+        .into_ssl("openrusty.org")
+        .unwrap();
+    let tcp = TcpStream::connect("127.0.0.1:6161").await.unwrap();
+    let mut stream = SslStream::new(ssl, tcp).unwrap();
+    Pin::new(&mut stream).connect().await.unwrap();
+
+    let request = format!(
+        "CONNECT pingora.org:443 HTTP/1.1\r\nHost: pingora.org:443\r\nX-Port: {upstream_port}\r\nX-Connect-Tunnel: true\r\n\r\nearly"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut resp = vec![];
+    let mut buf = [0u8; 1024];
+    let mut read_until = async |stream: &mut SslStream<TcpStream>, resp: &mut Vec<u8>, suffix| {
+        while !resp.ends_with(suffix) {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "connection closed early: {resp:?}");
+            resp.extend_from_slice(&buf[..n]);
+        }
+    };
+    read_until(&mut stream, &mut resp, b"early").await;
+    stream.write_all(b"ping").await.unwrap();
+    read_until(&mut stream, &mut resp, b"ping").await;
+
+    // close_notify ends our side of the tunnel
+    stream.shutdown().await.unwrap();
+    // read until the tunnel ends; a peer may close without its own close_notify
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => resp.extend_from_slice(&buf[..n]),
+        }
+    }
+
+    let header_end = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    assert!(resp.starts_with(b"HTTP/1.1 200 "), "{resp:?}");
+    resp.split_off(header_end)
+}
+
+#[cfg(feature = "openssl")]
+#[tokio::test]
+async fn test_connect_proxying_tunnel_tls13_half_close() {
+    init();
+    let (port, _) = spawn_h1_connect_origin().await;
+    let tunnel = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        h1_tls_connect_tunnel(port, pingora_core::tls::ssl::SslVersion::TLS1_3),
+    )
+    .await
+    .expect("tunnel stalled");
+    // TLS 1.3 allows a half-close: the rest of the upstream side still arrives
+    assert_eq!(tunnel, b"earlypingbye");
+}
+
+#[cfg(feature = "openssl")]
+#[tokio::test]
+async fn test_connect_proxying_tunnel_tls12_close_ends_tunnel() {
+    init();
+    let (port, _) = spawn_h1_connect_origin().await;
+    let tunnel = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        h1_tls_connect_tunnel(port, pingora_core::tls::ssl::SslVersion::TLS1_2),
+    )
+    .await
+    .expect("tunnel stalled");
+    // Before TLS 1.3 a close_notify closes the whole connection (RFC 5246 §7.2.1), so the
+    // client's close ends the tunnel instead of half-closing it
+    assert_eq!(tunnel, b"earlyping");
 }
 
 fn assert_connect_forwarded_without_framing(header: &[u8]) {

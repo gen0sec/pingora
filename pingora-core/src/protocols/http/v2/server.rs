@@ -291,6 +291,8 @@ pub struct HttpSession {
     pub write_timeout: Option<Duration>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
+    // Whether a 2xx response to a CONNECT may turn the stream into a tunnel
+    connect_tunnel_allowed: bool,
 }
 
 /// The outcome of accepting the next event on an HTTP/2 downstream connection.
@@ -499,6 +501,7 @@ impl HttpSession {
             digest,
             write_timeout: None,
             total_drain_timeout: None,
+            connect_tunnel_allowed: false,
         })))
     }
 
@@ -667,12 +670,27 @@ impl HttpSession {
         Ok(())
     }
 
-    fn is_connect_tunnel_resp(&self, header: &ResponseHeader) -> bool {
-        self.request_header.method == http::Method::CONNECT && header.status.is_success()
+    /// Allow a 2xx response to this CONNECT request to turn the stream into a tunnel.
+    ///
+    /// Off by default: a 2xx response to CONNECT is then sent as an ordinary response. Only
+    /// allow it once something is ready to carry the tunnel. Once the response is sent, every
+    /// DATA frame the client sends is handed on as opaque tunnel data, with no HTTP processing.
+    pub fn set_connect_tunnel_allowed(&mut self, allowed: bool) {
+        self.connect_tunnel_allowed = allowed;
     }
 
-    /// Whether the stream became a tunnel: the request was a CONNECT, and a 2xx response to it
-    /// was sent. From then on the DATA frames in both directions carry opaque tunnel bytes.
+    /// Whether a 2xx response to this request turns the stream into a tunnel, see
+    /// [`Self::set_connect_tunnel_allowed()`].
+    pub fn connect_tunnel_allowed(&self) -> bool {
+        self.connect_tunnel_allowed && self.request_header.method == http::Method::CONNECT
+    }
+
+    fn is_connect_tunnel_resp(&self, header: &ResponseHeader) -> bool {
+        self.connect_tunnel_allowed() && header.status.is_success()
+    }
+
+    /// Whether the stream became a tunnel: the request was a CONNECT allowed to
+    /// [tunnel](Self::set_connect_tunnel_allowed), and a 2xx response to it was sent. From then on the DATA frames in both directions carry opaque tunnel bytes.
     pub fn was_upgraded(&self) -> bool {
         self.response_written
             .as_deref()
@@ -680,9 +698,10 @@ impl HttpSession {
     }
 
     /// `Some(true)` if `header` turns this CONNECT stream into a tunnel, `Some(false)` if it
-    /// refuses the tunnel, and `None` if the request is not a CONNECT.
+    /// refuses the tunnel, and `None` if the request is not a CONNECT allowed to
+    /// [tunnel](Self::set_connect_tunnel_allowed).
     pub fn is_upgrade(&self, header: &ResponseHeader) -> Option<bool> {
-        (self.request_header.method == http::Method::CONNECT)
+        self.connect_tunnel_allowed()
             .then(|| self.is_connect_tunnel_resp(header))
     }
 

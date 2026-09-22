@@ -43,6 +43,13 @@ where
     {
         client_session.read_timeout = peer.options.read_timeout;
         client_session.write_timeout = peer.options.write_timeout;
+        // Only a peer that opted in may turn a proxied CONNECT into a tunnel, on both sides.
+        let connect_tunnel =
+            session.req_header().method == http::Method::CONNECT && peer.options.connect_tunnel;
+        client_session.set_connect_tunnel_allowed(connect_tunnel);
+        session
+            .downstream_session
+            .set_connect_tunnel_allowed(connect_tunnel);
 
         // phase 2 send to upstream
 
@@ -110,9 +117,10 @@ where
             }
         }
 
-        // A CONNECT has no content (RFC 9110 §9.3.6): anything the client sends is tunnel data,
-        // which is only forwarded once a 2xx establishes the tunnel.
-        let has_body = req.method != http::Method::CONNECT && !session.is_body_empty();
+        // A CONNECT has no content (RFC 9110 §9.3.6): when it may become a tunnel, anything the
+        // client sends is tunnel data, which is only forwarded once a 2xx establishes it.
+        let has_body =
+            !(connect_tunnel && req.method == http::Method::CONNECT) && !session.is_body_empty();
         if let Err(e) = finalize_h1_upstream_request_framing(&mut req, has_body) {
             return (false, true, Some(e));
         }
@@ -336,7 +344,8 @@ where
                             // except a CONNECT tunnel, which half-closes and keeps reading
                             if request_done
                                 && client_session.was_upgraded()
-                                && !client_session.is_connect_req()
+                                && !(client_session.connect_tunnel_allowed()
+                                    && client_session.tunnel_supports_half_close())
                             {
                                 response_done = true;
                             }
@@ -488,7 +497,11 @@ where
         }
 
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
-        let is_connect = session.req_header().method == http::Method::CONNECT;
+        // whether this CONNECT may become a tunnel
+        let is_connect = session.downstream_session.connect_tunnel_allowed();
+        // whether the client can end its side of that tunnel and still receive the other
+        let half_close_tunnel =
+            is_connect && session.downstream_session.tunnel_supports_half_close();
 
         let buffer = session.as_ref().get_retry_buffer();
 
@@ -603,8 +616,9 @@ where
                     };
                     // If the request is websocket, `None` body means the request is closed.
                     // Set the response to be done as well so that the request completes normally.
-                    // A CONNECT tunnel half-closes instead and keeps forwarding the response.
-                    if body.is_none() && session.was_upgraded() && !is_connect {
+                    // A CONNECT tunnel half-closes instead and keeps forwarding the response,
+                    // where the transport allows it.
+                    if body.is_none() && session.was_upgraded() && !half_close_tunnel {
                         response_state.maybe_set_upstream_done(true);
                     }
                     // TODO: consider just drain this if serve_from_cache is set
@@ -962,7 +976,7 @@ where
                 // a 2xx to CONNECT has no body either: the connection becomes a tunnel
                 let no_body = session.req_header().method == http::method::Method::HEAD
                     || matches!(header.status.as_u16(), 204 | 304)
-                    || (session.req_header().method == http::method::Method::CONNECT
+                    || (session.downstream_session.connect_tunnel_allowed()
                         && header.status.is_success());
                 if !no_body
                     && !header.status.is_informational()

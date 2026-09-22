@@ -768,7 +768,7 @@ where
     ) -> Result<()> {
         if *seen_upgraded
             && matches!(task, HttpTask::Body(..))
-            && self.req_header().method == http::Method::CONNECT
+            && self.downstream_session.connect_tunnel_allowed()
         {
             // An upstream that frames its tunnel bytes as a body (an h2 CONNECT stream carries
             // them in DATA frames) still sends tunnel bytes. Both sides agreed that this was a
@@ -1082,7 +1082,9 @@ fn reject_mismatched_h1_upgrade_101<DS>(
 where
     DS: DownstreamSession,
 {
-    if header.status.is_success() {
+    // Without tunnelling allowed a 2xx to CONNECT is an ordinary response, so there is no tunnel
+    // to desynchronize.
+    if header.status.is_success() && session.downstream_session.connect_tunnel_allowed() {
         let downstream_connect = session.req_header().method == http::Method::CONNECT;
         return match session.upstream_connect_request {
             Some(upstream_connect) if upstream_connect != downstream_connect => Error::e_explain(
@@ -2363,6 +2365,7 @@ mod tests {
         for tunnel_task in tunnel_tasks {
             let written = Arc::new(Mutex::new(Vec::new()));
             let mut session = new_connect_request_session(written.clone()).await;
+            session.downstream_session.set_connect_tunnel_allowed(true);
             session.set_upstream_connect_request(true);
 
             let response_done = session
@@ -2386,33 +2389,48 @@ mod tests {
 
     #[tokio::test]
     async fn write_response_tasks_rejects_2xx_with_connect_mismatch() {
-        // (downstream is CONNECT, upstream is CONNECT): a filter turned a CONNECT into a plain
-        // request upstream, or a plain request into a CONNECT
-        for (downstream_connect, upstream_connect) in [(true, false), (false, true)] {
-            let written = Arc::new(Mutex::new(Vec::new()));
-            let mut session = if downstream_connect {
-                new_connect_request_session(written.clone()).await
-            } else {
-                new_request_session(
-                    b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-                    written.clone(),
-                )
-                .await
-            };
-            session.set_upstream_connect_request(upstream_connect);
+        // a filter turned the downstream CONNECT into a plain request upstream
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_connect_request_session(written.clone()).await;
+        session.downstream_session.set_connect_tunnel_allowed(true);
+        session.set_upstream_connect_request(false);
 
-            let err = session
-                .write_response_tasks(vec![HttpTask::Header(
-                    Box::new(ResponseHeader::build(200, None).unwrap()),
-                    false,
-                )])
-                .await
-                .unwrap_err();
+        let err = session
+            .write_response_tasks(vec![HttpTask::Header(
+                Box::new(ResponseHeader::build(200, None).unwrap()),
+                false,
+            )])
+            .await
+            .unwrap_err();
 
-            assert_eq!(err.etype(), &InvalidHTTPHeader);
-            assert!(!session.was_upgraded());
-            assert!(written.lock().unwrap().is_empty());
-        }
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
+        assert!(!session.was_upgraded());
+        assert!(written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_response_tasks_2xx_to_connect_without_tunnel_allowed() {
+        // Unless tunnelling is allowed, a 2xx to CONNECT is an ordinary response.
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut session = new_connect_request_session(written.clone()).await;
+        session.set_upstream_connect_request(true);
+
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header.insert_header("Content-Length", "2").unwrap();
+        let response_done = session
+            .write_response_tasks(vec![
+                HttpTask::Header(Box::new(header), false),
+                HttpTask::Body(Some(Bytes::from_static(b"ok")), true),
+            ])
+            .await
+            .unwrap();
+
+        assert!(response_done);
+        assert!(!session.was_upgraded());
+        let written = written.lock().unwrap().clone();
+        let written = String::from_utf8_lossy(&written);
+        assert!(written.contains("Content-Length: 2\r\n"), "{written}");
+        assert!(written.ends_with("\r\n\r\nok"), "{written}");
     }
 
     #[tokio::test]
