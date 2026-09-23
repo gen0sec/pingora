@@ -40,9 +40,25 @@ pub use pingora_http::authority::{
 /// [RFC 9112 section 3.2.2], which replaces conflicting `Host`. Userinfo is unsafe because
 /// [`http::Uri::host`] strips it.
 ///
-/// Authority bytes otherwise remain opaque. HTTP/1 ingress and standard proxy egress call this;
+/// Comparing `Host` against a request target allows exactly two respellings of
+/// one origin: ASCII case in the host ([RFC 9110 section 4.2.3]) and a port
+/// written out that matches the scheme's default ([RFC 9110 section 4.2.1]).
+/// A caller must therefore not assume the two are byte-identical after this
+/// returns — notably when deriving a cache key or a routing decision from one
+/// of them. Authority bytes are otherwise opaque: no other normalization is
+/// applied, so a port that is not a plain number, and a value carrying more
+/// than one unbracketed colon, are equal only to the identical bytes.
+///
+/// For an HTTP/2 request the scheme comes from the client's `:scheme`, which is not checked
+/// against the transport, so a client chooses which of the two default ports may fold. Inside
+/// pingora-proxy this is contained, because an H1 upstream request takes its `Host` from
+/// `:authority`, but a filter reading the request header can see the two differ by that port.
+///
+/// HTTP/1 ingress and standard proxy egress call this;
 /// HTTP/2 performs equivalent stream-local checks.
 ///
+/// [RFC 9110 section 4.2.1]: https://www.rfc-editor.org/rfc/rfc9110.html#section-4.2.1
+/// [RFC 9110 section 4.2.3]: https://www.rfc-editor.org/rfc/rfc9110.html#section-4.2.3
 /// [RFC 9110 section 4.2.4]: https://www.rfc-editor.org/rfc/rfc9110.html#section-4.2.4
 /// [RFC 9112 section 3.2]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2
 /// [RFC 9112 section 3.2.2]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2.2
@@ -78,7 +94,7 @@ pub fn validate_request_authority(req: &RequestHeader) -> Result<()> {
             if authority.contains(&b'@') {
                 return Error::e_explain(InvalidHTTPHeader, "userinfo in request target");
             }
-            if host.is_some_and(|host| host.as_bytes() != authority) {
+            if host.is_some_and(|host| !same_authority(host.as_bytes(), authority, Some(scheme))) {
                 return Error::e_explain(
                     InvalidHTTPHeader,
                     "Host header differs from request-target authority",
@@ -90,8 +106,13 @@ pub fn validate_request_authority(req: &RequestHeader) -> Result<()> {
     Ok(())
 }
 
-/// Validate authority fields shared by H1 and H2 ingress.
-pub(super) fn validate_request_authority_fields(req: &RequestHeader) -> Result<()> {
+/// Validate the authority fields themselves: at most one `Host`, and no userinfo in either the
+/// `Host` header or the URI authority.
+///
+/// This is the part of [`validate_request_authority_fields`] that does not compare the two.
+/// A CONNECT target is reconciled against `Host` by
+/// [`validate_connect_target_authority`] instead, under its own byte-exact rule.
+pub(super) fn validate_request_authority_field_syntax(req: &RequestHeader) -> Result<()> {
     let mut hosts = req.headers.get_all(header::HOST).iter();
     let (host, duplicate_host) = (hosts.next(), hosts.next());
 
@@ -103,15 +124,27 @@ pub(super) fn validate_request_authority_fields(req: &RequestHeader) -> Result<(
         return Error::e_explain(InvalidHTTPHeader, "userinfo in Host header");
     }
 
-    let uri_authority = req.uri.authority().map(|authority| authority.as_str());
-    if uri_authority.is_some_and(|authority| authority.contains('@')) {
+    if req
+        .uri
+        .authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+    {
         return Error::e_explain(InvalidHTTPHeader, "userinfo in URI authority");
     }
 
-    if host
-        .zip(uri_authority)
-        .is_some_and(|(host, authority)| host.as_bytes() != authority.as_bytes())
-    {
+    Ok(())
+}
+
+/// Validate authority fields shared by H1 and H2 ingress.
+pub(super) fn validate_request_authority_fields(req: &RequestHeader) -> Result<()> {
+    validate_request_authority_field_syntax(req)?;
+
+    let host = req.headers.get(header::HOST);
+    let uri_authority = req.uri.authority().map(|authority| authority.as_str());
+    let scheme = req.uri.scheme_str().map(|scheme| scheme.as_bytes());
+    if host.zip(uri_authority).is_some_and(|(host, authority)| {
+        !same_authority(host.as_bytes(), authority.as_bytes(), scheme)
+    }) {
         return Error::e_explain(InvalidHTTPHeader, "Host header differs from URI authority");
     }
 
@@ -189,6 +222,46 @@ fn validate_connect_authority(target: &[u8], host: Option<&HeaderValue>) -> Resu
     }
 }
 
+/// Validate a CONNECT target that is only an authority (`host:port`) against `Host`.
+///
+/// This is the rule [`validate_request_authority`] applies to an HTTP/1 authority-form CONNECT
+/// target, for callers that already hold the authority on its own, such as an HTTP/2
+/// `:authority`. Keeping the two on one rule stops the same CONNECT from being judged
+/// differently depending on the client's protocol version.
+///
+/// `Host` is reconciled byte-for-byte, not through [`same_authority`]: a CONNECT target names a
+/// tunnel destination rather than an origin to route within, so it is not widened by the
+/// case and default-port equivalences that apply elsewhere.
+pub(super) fn validate_connect_target_authority(
+    authority: &[u8],
+    host: Option<&HeaderValue>,
+) -> Result<()> {
+    if authority.contains(&b'@') {
+        return Error::e_explain(InvalidHTTPHeader, "userinfo in CONNECT authority");
+    }
+    if has_ambiguous_port_suffix(authority) {
+        return Error::e_explain(InvalidHTTPHeader, "ambiguous CONNECT request target");
+    }
+    match http::uri::Authority::try_from(authority) {
+        // A port-less authority carries no port to disagree about; H1 leaves what `Host` may
+        // then say to the application.
+        Ok(parsed) if parsed.port().is_none() => Ok(()),
+        Ok(parsed) => match host {
+            Some(host) => reconcile_connect_host(authority, parsed.host().as_bytes(), host),
+            None => Ok(()),
+        },
+        // An authority that does not parse cannot be reconciled by component, so it must match
+        // `Host` byte-for-byte, as H1 requires of the same target.
+        Err(_) => match host {
+            Some(host) => reconcile_connect_host(authority, authority, host),
+            None => Error::e_explain(
+                InvalidHTTPHeader,
+                "missing Host header for malformed CONNECT request target",
+            ),
+        },
+    }
+}
+
 /// Accept `Host` only when it names the complete CONNECT authority or its host component.
 ///
 /// The host-only form follows the [RFC 9112 section 3.2.3] example:
@@ -207,6 +280,139 @@ fn reconcile_connect_host(
             InvalidHTTPHeader,
             "Host header differs from CONNECT request target",
         )
+    }
+}
+
+/// Whether `host` and `target` name the same authority.
+///
+/// Byte equality, widened by exactly two equivalences that cannot make two
+/// parsers disagree about *which* host is named:
+///
+/// * the host is compared ASCII-case-insensitively, because registered names
+///   are case-insensitive (RFC 9110 §4.2.3), and
+/// * an absent port equals the scheme's default, because `http://a.example/`
+///   and `Host: a.example:80` are the same origin (RFC 9110 §4.2.1).
+///
+/// Everything else stays byte-exact, deliberately. The strictness this widens
+/// exists to stop one target being read as two different hosts — userinfo
+/// hiding a second name, multiple unbracketed colons, slash normalisation
+/// moving the authority's end — and neither case nor a default port does that.
+/// In particular a trailing dot is still a mismatch: `a.example.` is a
+/// different field value, not a different spelling.
+///
+/// Two narrower rules keep this from becoming a divergence of its own:
+///
+/// * the case-insensitive compare is skipped when either side contains `%`.
+///   Percent-encodings and IPv6 zone IDs are **not** case-insensitive, and
+///   folding them would make `%2F` equal `%2f` and `%25Eth0` equal `%25eth0`.
+/// * ports are compared as parsed numbers, never by stripping a `:443`
+///   suffix, so `a.example:0443` and `a.example:443x` stay distinct.
+///
+/// The host/port split assumes at most one unbracketed colon, so this checks
+/// [`has_ambiguous_port_suffix`] on the `Host` itself — that header reaches
+/// here unparsed, and a multi-colon spelling is the module's own definition
+/// of a value two parsers will read differently.
+pub(super) fn same_authority(host: &[u8], target: &[u8], scheme: Option<&[u8]>) -> bool {
+    if host == target {
+        return true;
+    }
+
+    // Neither side is assumed to have been parsed before reaching here: a custom-scheme
+    // absolute-form target skips `Authority::try_from`, an H2 `:authority` reaches this
+    // through no guard at all, and a `Host` header is parsed nowhere else. The split below
+    // reads only the first unbracketed colon, where another parser may read the last, so a
+    // multi-colon value must not reach it: on the target the split leaves a malformed port,
+    // which compares equal to nothing, and on `Host` this rejects outright.
+    if has_ambiguous_port_suffix(host) {
+        return false;
+    }
+
+    let (host_name, host_port) = split_host_port(host);
+    let (target_name, target_port) = split_host_port(target);
+
+    let names_match = if host_name.contains(&b'%') || target_name.contains(&b'%') {
+        host_name == target_name
+    } else {
+        host_name.eq_ignore_ascii_case(target_name)
+    };
+    if !names_match {
+        return false;
+    }
+
+    match (port_of(host_port), port_of(target_port)) {
+        // A port neither side can agree how to read is not an equivalence.
+        // Folding it into "absent" would have matched it against the
+        // scheme's default, which is how `a.example:` and
+        // `a.example:8080:443` came to equal `a.example:80` and
+        // `a.example:443`.
+        (Port::Malformed, _) | (_, Port::Malformed) => false,
+        (Port::Number(a), Port::Number(b)) => a == b,
+        // One side wrote the port the other left implicit.
+        (Port::Number(port), Port::Absent) | (Port::Absent, Port::Number(port)) => {
+            default_port(scheme) == Some(port)
+        }
+        (Port::Absent, Port::Absent) => true,
+    }
+}
+
+/// A port as this module is willing to read it.
+enum Port {
+    Absent,
+    Number(u16),
+    /// Written, but not as a plain number this and every other parser would
+    /// read the same way. Never equal to anything, including itself.
+    Malformed,
+}
+
+/// Split an authority into its host and its port bytes, keeping IPv6 brackets
+/// with the host. Assumes at most one unbracketed colon.
+fn split_host_port(authority: &[u8]) -> (&[u8], Option<&[u8]>) {
+    let after_brackets = match authority.iter().rposition(|&b| b == b']') {
+        Some(end) => end + 1,
+        None => 0,
+    };
+    match authority[after_brackets..].iter().position(|&b| b == b':') {
+        Some(offset) => {
+            let colon = after_brackets + offset;
+            (&authority[..colon], Some(&authority[colon + 1..]))
+        }
+        None => (authority, None),
+    }
+}
+
+/// Classify an authority's port bytes.
+///
+/// Absent and malformed are kept apart deliberately: only an *absent* port
+/// can stand in for the scheme's default. Numeric rather than textual, so
+/// `443x` cannot read as 443, and a leading zero is refused rather than
+/// folded — `0443` is numerically 443, but a peer that rejects it while this
+/// accepted it is the disagreement this module exists to prevent.
+fn port_of(port: Option<&[u8]>) -> Port {
+    let Some(port) = port else {
+        return Port::Absent;
+    };
+    if port.is_empty() || port.iter().any(|b| !b.is_ascii_digit()) {
+        return Port::Malformed;
+    }
+    if port.len() > 1 && port[0] == b'0' {
+        return Port::Malformed;
+    }
+    match std::str::from_utf8(port).ok().and_then(|p| p.parse().ok()) {
+        Some(number) => Port::Number(number),
+        // Out of range for a port.
+        None => Port::Malformed,
+    }
+}
+
+/// The port a scheme implies when the authority leaves it out.
+fn default_port(scheme: Option<&[u8]>) -> Option<u16> {
+    let scheme = scheme?;
+    if scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"ws") {
+        Some(80)
+    } else if scheme.eq_ignore_ascii_case(b"https") || scheme.eq_ignore_ascii_case(b"wss") {
+        Some(443)
+    } else {
+        None
     }
 }
 
@@ -309,6 +515,106 @@ mod tests {
     }
 
     #[test]
+    fn same_authority_widens_only_case_and_the_default_port() {
+        // The two equivalences.
+        assert!(same_authority(b"A.Example", b"a.example", Some(b"http")));
+        assert!(same_authority(b"a.example:80", b"a.example", Some(b"http")));
+        assert!(same_authority(b"a.example", b"a.example:80", Some(b"http")));
+        assert!(same_authority(
+            b"a.example:443",
+            b"a.example",
+            Some(b"https")
+        ));
+        assert!(same_authority(b"a.example", b"a.example:443", Some(b"wss")));
+
+        // Different host, different port, or the wrong scheme's default.
+        assert!(!same_authority(b"b.example", b"a.example", Some(b"http")));
+        assert!(!same_authority(
+            b"a.example:8080",
+            b"a.example",
+            Some(b"http")
+        ));
+        assert!(!same_authority(
+            b"a.example:443",
+            b"a.example",
+            Some(b"http")
+        ));
+        assert!(!same_authority(
+            b"a.example:80",
+            b"a.example",
+            Some(b"https")
+        ));
+
+        // A trailing dot is a different field value, not a spelling.
+        assert!(!same_authority(b"a.example.", b"a.example", Some(b"http")));
+
+        // A malformed port is not an absent one. Each of these is paired
+        // with a target that *carries* the default port explicitly, which
+        // is the only shape that reaches the mixed arm — pinning them
+        // against a portless target instead passes whether or not the
+        // distinction exists.
+        for bad in [
+            &b"a.example:"[..],
+            b"a.example:443x",
+            b"a.example:0443",
+            b"a.example:65536",
+            b"a.example:+443",
+            // Multiple unbracketed colons: read as port `8080:443` here and
+            // as `8080` by a parser that takes the last colon.
+            b"a.example:8080:443",
+        ] {
+            assert!(
+                !same_authority(bad, b"a.example:443", Some(b"https")),
+                "{} should not equal a.example:443",
+                String::from_utf8_lossy(bad)
+            );
+            assert!(
+                !same_authority(bad, b"a.example", Some(b"https")),
+                "{} should not equal a.example",
+                String::from_utf8_lossy(bad)
+            );
+        }
+
+        // Ports are numbers, not a `:443` suffix to strip.
+        assert!(!same_authority(
+            b"a.example:0443",
+            b"a.example",
+            Some(b"https")
+        ));
+        assert!(!same_authority(
+            b"a.example:443x",
+            b"a.example",
+            Some(b"https")
+        ));
+        assert!(!same_authority(b"a.example:", b"a.example", Some(b"https")));
+
+        // Percent-encodings and IPv6 zone IDs are case-sensitive.
+        assert!(!same_authority(
+            b"[fe80::1%25Eth0]",
+            b"[fe80::1%25eth0]",
+            Some(b"http")
+        ));
+        assert!(same_authority(
+            b"[fe80::1%25eth0]",
+            b"[fe80::1%25eth0]",
+            Some(b"http")
+        ));
+
+        // Nested brackets are ambiguous in their own right, and the port
+        // here parses cleanly — so `has_ambiguous_port_suffix` is the only
+        // thing rejecting this, not the port classification.
+        assert!(!same_authority(b"[a[b]:80", b"[A[B]:80", Some(b"http")));
+
+        // IPv6 keeps its brackets with the host, and its port is still a port.
+        assert!(same_authority(b"[::1]:443", b"[::1]", Some(b"https")));
+        assert!(!same_authority(b"[::1]:8443", b"[::1]", Some(b"https")));
+
+        // Without a scheme there is no default to imply.
+        assert!(!same_authority(b"a.example:443", b"a.example", None));
+        assert!(same_authority(b"A.Example", b"a.example", None));
+    }
+
+    #[test]
     fn validate_absolute_form() {
         assert!(validate_request_authority(&request(
             "GET",
@@ -402,6 +708,59 @@ mod tests {
             &["authority.example"]
         ))
         .is_ok());
+    }
+
+    #[test]
+    fn absolute_form_host_may_differ_in_case_or_default_port() {
+        for (target, host) in [
+            ("http://authority.example/test", "AUTHORITY.EXAMPLE"),
+            ("http://AUTHORITY.EXAMPLE/test", "authority.example"),
+            ("http://authority.example/test", "authority.example:80"),
+            ("http://authority.example:80/test", "authority.example"),
+            ("https://authority.example/test", "authority.example:443"),
+            ("ws://authority.example/test", "authority.example:80"),
+        ] {
+            let req = request("GET", target, &[host]);
+            assert!(
+                validate_request_authority(&req).is_ok(),
+                "{target} with Host: {host} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_form_host_must_still_name_the_same_origin() {
+        for (target, host) in [
+            // A different host.
+            ("http://authority.example/test", "other.example"),
+            // A trailing dot is a different field value.
+            ("http://authority.example/test", "authority.example."),
+            // Not the scheme's default port.
+            ("http://authority.example/test", "authority.example:443"),
+            ("https://authority.example/test", "authority.example:80"),
+            ("http://authority.example:8080/test", "authority.example"),
+            // A port that is not a plain number, against a target that
+            // carries the default port explicitly as well as one that
+            // leaves it implicit.
+            ("https://authority.example/test", "authority.example:0443"),
+            (
+                "https://authority.example:443/test",
+                "authority.example:0443",
+            ),
+            ("http://authority.example:80/test", "authority.example:"),
+            ("http://authority.example:80/test", "authority.example:80x"),
+            // Two unbracketed colons is a value two parsers read differently.
+            (
+                "https://authority.example:443/test",
+                "authority.example:8080:443",
+            ),
+        ] {
+            let req = request("GET", target, &[host]);
+            assert!(
+                validate_request_authority(&req).is_err(),
+                "{target} with Host: {host} should be rejected"
+            );
+        }
     }
 
     #[test]

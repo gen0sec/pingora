@@ -32,8 +32,8 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use crate::protocols::http::authority::{
-    has_ambiguous_port_suffix, raw_target_authority, validate_request_authority_fields,
-    RawTargetAuthority,
+    raw_target_authority, validate_connect_target_authority,
+    validate_request_authority_field_syntax, validate_request_authority_fields, RawTargetAuthority,
 };
 use crate::protocols::http::body_buffer::FixedBuffer;
 use crate::protocols::http::date::get_cached_date;
@@ -328,7 +328,19 @@ pub enum H2Accept {
 /// [RFC 9112 section 3.2]: https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2
 /// [RFC 9113 section 8.3.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1
 fn invalid_request_authority(request: &RequestHeader) -> bool {
-    if let Err(error) = validate_request_authority_fields(request) {
+    // Normal CONNECT has no `:protocol` and carries its target only in `:authority`. Extended
+    // CONNECT sets `:protocol` and also has a `:path`, which must pass the raw-target checks below.
+    let is_normal_connect = request.method == http::Method::CONNECT
+        && request.extensions.get::<h2::ext::Protocol>().is_none();
+
+    // A normal CONNECT reconciles `:authority` with `Host` under the CONNECT rule below, so only
+    // the field syntax is shared with other requests here.
+    let fields = if is_normal_connect {
+        validate_request_authority_field_syntax(request)
+    } else {
+        validate_request_authority_fields(request)
+    };
+    if let Err(error) = fields {
         debug!("rejecting downstream h2 request: {error}");
         return true;
     }
@@ -337,21 +349,22 @@ fn invalid_request_authority(request: &RequestHeader) -> bool {
         return true;
     }
 
-    // Normal CONNECT has no `:protocol` and carries its target only in `:authority`. Extended
-    // CONNECT sets `:protocol` and also has a `:path`, which must pass the raw-target checks below.
-    let is_normal_connect = request.method == http::Method::CONNECT
-        && request.extensions.get::<h2::ext::Protocol>().is_none();
     if is_normal_connect {
-        if request
-            .uri
-            .authority()
-            .is_some_and(|authority| has_ambiguous_port_suffix(authority.as_str().as_bytes()))
-        {
-            debug!("rejecting downstream h2 request: ambiguous CONNECT authority");
+        // The same reconciliation H1 applies to an authority-form CONNECT target, so that one
+        // CONNECT is not judged differently depending on the client's protocol version.
+        let Some(authority) = request.uri.authority() else {
+            // RFC 9113 section 8.5 requires `:authority` on a CONNECT.
+            debug!("rejecting downstream h2 request: CONNECT without :authority");
             return true;
-        } else {
-            return false;
+        };
+        if let Err(error) = validate_connect_target_authority(
+            authority.as_str().as_bytes(),
+            request.headers.get(header::HOST),
+        ) {
+            debug!("rejecting downstream h2 request: {error}");
+            return true;
         }
+        return false;
     }
     match raw_target_authority(request.raw_path()) {
         RawTargetAuthority::None => false,
@@ -1069,11 +1082,17 @@ mod test {
         assert!(invalid_request_authority(&authority_request(&[
             "other.example"
         ])));
-        assert!(invalid_request_authority(&authority_request(&[
+        // Case and an explicit default port name the same host, so they are
+        // accepted; everything else about the comparison stays byte-exact.
+        assert!(!invalid_request_authority(&authority_request(&[
             "AUTHORITY.EXAMPLE"
         ])));
-        assert!(invalid_request_authority(&authority_request(&[
+        assert!(!invalid_request_authority(&authority_request(&[
             "authority.example:443"
+        ])));
+        // ...but only the scheme's own default. `:authority` here is https.
+        assert!(invalid_request_authority(&authority_request(&[
+            "authority.example:80"
         ])));
         assert!(invalid_request_authority(&authority_request(&[
             "authority.example",
@@ -1094,8 +1113,13 @@ mod test {
             "https://authority.example:443/test",
             &["other.example"]
         )));
-        assert!(invalid_request_authority(&request(
+        assert!(!invalid_request_authority(&request(
             "https://authority.example:443/test",
+            &["authority.example"]
+        )));
+        // A non-default port is still a different origin.
+        assert!(invalid_request_authority(&request(
+            "https://authority.example:8443/test",
             &["authority.example"]
         )));
         assert!(!invalid_request_authority(&request(
@@ -1182,6 +1206,78 @@ mod test {
                 .0,
         );
         assert!(!invalid_request_authority(&connect));
+
+        // H1 and H2 must reach the same verdict on the same CONNECT: the target names a tunnel
+        // destination, so `Host` is reconciled byte-for-byte on both.
+        let h2_connect = |authority: &str, host: Option<&str>| {
+            let mut request = RequestHeader::from(
+                Request::builder()
+                    .method(http::Method::CONNECT)
+                    .uri(authority)
+                    .body(())
+                    .unwrap()
+                    .into_parts()
+                    .0,
+            );
+            if let Some(host) = host {
+                request.append_header(header::HOST, host).unwrap();
+            }
+            request
+        };
+        let h1_connect = |authority: &str, host: Option<&str>| {
+            let mut request =
+                RequestHeader::build(http::Method::CONNECT, authority.as_bytes(), None).unwrap();
+            if let Some(host) = host {
+                request.append_header(header::HOST, host).unwrap();
+            }
+            request
+        };
+        for (authority, host, valid) in [
+            ("example.com:443", Some("example.com:443"), true),
+            ("example.com:443", Some("example.com"), true),
+            ("example.com:443", None, true),
+            // a case-differing Host names the same host, but a CONNECT target is not widened
+            ("example.com:443", Some("EXAMPLE.COM:443"), false),
+            ("example.com:443", Some("other.example:443"), false),
+            // no port in the target: nothing to disagree about, left to the application
+            ("example.com", Some("other.example"), true),
+            // a malformed port is not reconciled by component, so any Host is left to the
+            // application, as in the port-less case
+            ("example.com:443x", Some("example.com:443x"), true),
+            ("example.com:443x", Some("example.com"), true),
+        ] {
+            let case = format!("CONNECT {authority} with Host: {host:?}");
+            assert_eq!(
+                !invalid_request_authority(&h2_connect(authority, host)),
+                valid,
+                "h2: {case}"
+            );
+            assert_eq!(
+                crate::protocols::http::authority::validate_request_authority(&h1_connect(
+                    authority, host
+                ))
+                .is_ok(),
+                valid,
+                "h1: {case}"
+            );
+        }
+        // An ambiguous authority cannot reach h2 at all: it is not a parseable `:authority`.
+        assert!("example.com:443:8443".parse::<http::Uri>().is_err());
+        assert!(
+            crate::protocols::http::authority::validate_request_authority(&h1_connect(
+                "example.com:443:8443",
+                Some("example.com:443:8443")
+            ))
+            .is_err()
+        );
+
+        // RFC 9113 section 8.5 requires `:authority` on a CONNECT
+        let mut no_authority = RequestHeader::build_no_case("GET", b"/", None).unwrap();
+        no_authority.set_method(http::Method::CONNECT);
+        no_authority
+            .append_header(header::HOST, "example.com:443")
+            .unwrap();
+        assert!(invalid_request_authority(&no_authority));
 
         let mut extended_connect =
             raw_path_request("http://other.example/tunnel", "authority.example");
