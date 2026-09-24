@@ -403,7 +403,7 @@ where
     ///
     /// On h2 this bounds reading the request body. It does not bound the
     /// idle wait that watches for the client going away — see
-    /// [`v2::server::HttpSession::set_read_timeout`].
+    /// [`SessionV2::set_read_timeout`].
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         match self {
             Self::H1(s) => s.set_read_timeout(timeout),
