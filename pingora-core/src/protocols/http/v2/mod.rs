@@ -653,6 +653,179 @@ mod test {
         client_handle.await.unwrap();
     }
 
+    /// Open one h2 stream whose HEADERS do *not* end the stream, so the
+    /// server expects a request body, and hand the accepted session back.
+    ///
+    /// The client then sends whatever `client_body` does and parks. The
+    /// returned `oneshot::Sender` owns the client end: dropping it lets the
+    /// client task finish, which closes the duplex — so a test that wants a
+    /// *stall* rather than an EOF must hold it for the whole read.
+    async fn stream_expecting_a_body<F, Fut>(
+        read_timeout: Option<Duration>,
+        client_body: F,
+    ) -> (
+        crate::protocols::http::server::Session<()>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        F: FnOnce(h2::Codec<DuplexStream, Bytes>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = h2::Codec<DuplexStream, Bytes>> + Send,
+    {
+        let (mut client, server) = duplex(65536);
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+
+            let mut headers = Headers::new(
+                1.into(),
+                Pseudo::request(
+                    Method::POST,
+                    Uri::from_static("https://one.one.one.one/"),
+                    None,
+                ),
+                HeaderMap::new(),
+            );
+            headers.set_end_headers();
+            // Deliberately no `set_end_stream`: the server is told a body is
+            // coming, which is what puts it in `read_body_bytes`.
+            codec.send(headers.into()).await.unwrap();
+
+            let _codec = client_body(codec).await;
+
+            // Hold the connection open until the test lets go.
+            let _ = stop_rx.await;
+        });
+
+        let mut conn = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let accepted = pingora_timeout::timeout(
+            Duration::from_secs(2),
+            HttpSession::from_h2_conn(&mut conn, digest),
+        )
+        .await
+        .expect("the server never accepted the stream")
+        .expect("accepting the stream failed")
+        .expect("the connection ended before a stream arrived");
+
+        let session = match accepted {
+            H2Accept::Session(s) => s,
+            H2Accept::Rejected => panic!("the request was rejected, not accepted"),
+        };
+        // Wrap in the protocol-agnostic session. The timeout is set through
+        // *that* API, because `HttpSession::set_read_timeout` dispatching to
+        // the h2 arm is the thing a proxy actually relies on — reaching past
+        // it to the inner session would leave the dispatch untested.
+        let mut session = crate::protocols::http::server::Session::new_http2(session);
+        session.set_read_timeout(read_timeout);
+        assert_eq!(
+            session.get_read_timeout(),
+            read_timeout,
+            "the h2 arm must not silently drop the read timeout"
+        );
+
+        // The h2 connection future has to keep being polled or no frame ever
+        // reaches the session. Nothing else drives it in this test.
+        tokio::spawn(async move { while conn.accept().await.is_some() {} });
+
+        (session, stop_tx, client_handle)
+    }
+
+    /// The gap: an h2 client that announces a body and then stops sending
+    /// held a stream open forever, because `set_read_timeout` was a no-op on
+    /// h2 while HTTP/1 honoured it.
+    #[tokio::test]
+    async fn test_h2_read_body_times_out_on_a_stalled_body() {
+        let (mut session, _stop, _client) =
+            stream_expecting_a_body(Some(Duration::from_millis(200)), |c| async { c }).await;
+
+        let err = pingora_timeout::timeout(Duration::from_secs(5), session.read_request_body())
+            .await
+            .expect("the read hung instead of timing out")
+            .expect_err("a stalled body must not read as success");
+
+        assert_eq!(
+            err.etype(),
+            &pingora_error::ErrorType::ReadTimedout,
+            "a stalled h2 body must fail as a read timeout, got {err}"
+        );
+    }
+
+    /// The control: without a timeout the old behaviour is kept exactly, so
+    /// the fix cannot be mistaken for "h2 bodies now always expire".
+    #[tokio::test]
+    async fn test_h2_read_body_without_a_timeout_waits() {
+        let (mut session, _stop, _client) = stream_expecting_a_body(None, |c| async { c }).await;
+
+        let outcome =
+            pingora_timeout::timeout(Duration::from_millis(400), session.read_request_body()).await;
+
+        assert!(
+            outcome.is_err(),
+            "with no read timeout the read must stay pending, got {:?}",
+            outcome.map(|r| r.map(|b| b.map(|b| b.len())))
+        );
+    }
+
+    /// The timeout is per read, reset on every DATA frame — the same
+    /// semantics HTTP/1 already has. A body that keeps arriving, however
+    /// slowly, must not be cut off; only a stalled one is.
+    #[tokio::test]
+    async fn test_h2_read_body_allows_a_slow_but_progressing_body() {
+        let (mut session, _stop, _client) =
+            stream_expecting_a_body(Some(Duration::from_millis(300)), |mut codec| async move {
+                for _ in 0..4 {
+                    sleep(Duration::from_millis(150)).await;
+                    let data = Data::new(1.into(), Bytes::from_static(b"xy"));
+                    codec.send(data.into()).await.unwrap();
+                }
+                codec
+            })
+            .await;
+
+        let mut total = 0usize;
+        for _ in 0..4 {
+            let chunk =
+                pingora_timeout::timeout(Duration::from_secs(5), session.read_request_body())
+                    .await
+                    .expect("the read hung")
+                    .expect("a body that keeps arriving must not time out");
+            total += chunk.expect("the body ended early").len();
+        }
+
+        assert_eq!(
+            total, 8,
+            "every slowly-sent DATA frame should have been read"
+        );
+    }
+
+    /// The negative that matters most. `read_body_or_idle` parks on
+    /// `idle()` to watch for the client going away while the *upstream* is
+    /// still working. That wait is unbounded on purpose: timing it out would
+    /// kill every request whose upstream takes longer than the read timeout.
+    #[tokio::test]
+    async fn test_h2_idle_watch_is_not_subject_to_the_read_timeout() {
+        let (mut session, _stop, _client) =
+            stream_expecting_a_body(Some(Duration::from_millis(200)), |c| async { c }).await;
+
+        let outcome =
+            pingora_timeout::timeout(Duration::from_millis(600), session.read_body_or_idle(true))
+                .await;
+
+        assert!(
+            outcome.is_err(),
+            "the disconnect watch must outlive the read timeout, got {:?}",
+            outcome.map(|r| r.map(|b| b.map(|b| b.len())))
+        );
+    }
+
     #[tokio::test]
     async fn test_graceful_shutdown_refuses_stream_above_last_stream_id() {
         // After the server commits to a final last_stream_id and emits the

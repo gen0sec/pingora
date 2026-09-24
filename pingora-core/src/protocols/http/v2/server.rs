@@ -289,6 +289,10 @@ pub struct HttpSession {
     /// The timeout is reset on every write. This is not a timeout on the overall duration of the
     /// response.
     pub write_timeout: Option<Duration>,
+    /// The read timeout applied to reading the request body.
+    /// The timeout is reset on every read, so it bounds a *stalled* body, not
+    /// a slow one — the same semantics HTTP/1.x has.
+    read_timeout: Option<Duration>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
     // Whether a 2xx response to a CONNECT may turn the stream into a tunnel
@@ -513,6 +517,7 @@ impl HttpSession {
             retry_buffer: None,
             digest,
             write_timeout: None,
+            read_timeout: None,
             total_drain_timeout: None,
             connect_tunnel_allowed: false,
         })))
@@ -535,8 +540,23 @@ impl HttpSession {
     }
 
     /// Read request body bytes. `None` when there is no more body to read.
+    ///
+    /// Subject to the read timeout set by [`Self::set_read_timeout`], which is
+    /// reset on every read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        // TODO: timeout
+        match self.read_timeout {
+            Some(t) => match timeout(t, self.do_read_body_bytes()).await {
+                Ok(res) => res,
+                Err(_) => Error::e_explain(
+                    ErrorType::ReadTimedout,
+                    format!("reading downstream request body, timeout: {t:?}"),
+                ),
+            },
+            None => self.do_read_body_bytes().await,
+        }
+    }
+
+    async fn do_read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         let data = self.request_body_reader.data().await.transpose().or_err(
             ErrorType::ReadError,
             "while reading downstream request body",
@@ -554,6 +574,8 @@ impl HttpSession {
         Ok(data)
     }
 
+    /// Not subject to the read timeout: a `Poll` cannot await one. No caller
+    /// in this workspace uses it.
     #[doc(hidden)]
     pub fn poll_read_body_bytes(
         &mut self,
@@ -612,6 +634,23 @@ impl HttpSession {
     /// Get the write timeout.
     pub fn get_write_timeout(&self) -> Option<Duration> {
         self.write_timeout
+    }
+
+    /// Sets the downstream read timeout. This will trigger if we're unable to
+    /// read the request body after `timeout`.
+    ///
+    /// The timeout is reset on every read, so it bounds a body that has
+    /// stalled, not one that is merely slow. It does **not** apply to
+    /// [`Self::idle`] or to the idle branch of [`Self::read_body_or_idle`]:
+    /// that wait watches for the client going away while the upstream works,
+    /// and bounding it would cut off every slow upstream.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
+    /// Get the read timeout.
+    pub fn get_read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
 
     /// Sets the total drain timeout. This `timeout` will be used while draining
