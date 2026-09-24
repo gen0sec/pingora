@@ -291,7 +291,8 @@ pub struct HttpSession {
     pub write_timeout: Option<Duration>,
     /// The read timeout applied to reading the request body.
     /// The timeout is reset on every read, so it bounds a *stalled* body, not
-    /// a slow one — the same semantics HTTP/1.x has.
+    /// a slow one — the same semantics, and the same 60s default, as HTTP/1.x.
+    /// It does not apply once the stream has become a tunnel.
     read_timeout: Option<Duration>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
@@ -517,7 +518,7 @@ impl HttpSession {
             retry_buffer: None,
             digest,
             write_timeout: None,
-            read_timeout: None,
+            read_timeout: Some(Duration::from_secs(60)),
             total_drain_timeout: None,
             connect_tunnel_allowed: false,
         })))
@@ -542,8 +543,15 @@ impl HttpSession {
     /// Read request body bytes. `None` when there is no more body to read.
     ///
     /// Subject to the read timeout set by [`Self::set_read_timeout`], which is
-    /// reset on every read.
+    /// reset on every read and does not apply once [`Self::was_upgraded`].
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
+        // Once a CONNECT stream has been answered 2xx, its DATA frames are
+        // tunnel bytes rather than a request body, and a quiet tunnel is
+        // normal traffic. HTTP/1 pends rather than timing out in the same
+        // situation (`v1::server::HttpSession::read_body_or_idle`).
+        if self.was_upgraded() {
+            return self.do_read_body_bytes().await;
+        }
         match self.read_timeout {
             Some(t) => match timeout(t, self.do_read_body_bytes()).await {
                 Ok(res) => res,
@@ -639,11 +647,20 @@ impl HttpSession {
     /// Sets the downstream read timeout. This will trigger if we're unable to
     /// read the request body after `timeout`.
     ///
+    /// Defaults to 60s, matching HTTP/1.x.
+    ///
     /// The timeout is reset on every read, so it bounds a body that has
-    /// stalled, not one that is merely slow. It does **not** apply to
-    /// [`Self::idle`] or to the idle branch of [`Self::read_body_or_idle`]:
-    /// that wait watches for the client going away while the upstream works,
-    /// and bounding it would cut off every slow upstream.
+    /// stalled, not one that is merely slow. It does **not** apply to:
+    ///
+    /// - [`Self::idle`] or the idle branch of [`Self::read_body_or_idle`],
+    ///   which watch for the client going away while the upstream works;
+    ///   bounding that would cut off every slow upstream;
+    /// - a stream that [`Self::was_upgraded`] into a tunnel, whose DATA
+    ///   frames are tunnel bytes and may legitimately pause.
+    ///
+    /// A long-lived h2 request body that is *not* a tunnel — a bidirectional
+    /// gRPC stream, say — is bounded by this, exactly as a long-lived h1
+    /// request body is. Clear the timeout for those streams.
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         self.read_timeout = timeout;
     }

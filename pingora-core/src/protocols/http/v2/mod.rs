@@ -672,6 +672,27 @@ mod test {
         F: FnOnce(h2::Codec<DuplexStream, Bytes>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = h2::Codec<DuplexStream, Bytes>> + Send,
     {
+        stream_expecting_a_body_with(Method::POST, read_timeout, client_body, |_| {}).await
+    }
+
+    /// As [`stream_expecting_a_body`], with the request method and a hook that
+    /// configures the raw h2 session before it is wrapped — which is how a
+    /// CONNECT stream is turned into an established tunnel.
+    async fn stream_expecting_a_body_with<F, Fut, C>(
+        method: Method,
+        read_timeout: Option<Duration>,
+        client_body: F,
+        configure: C,
+    ) -> (
+        crate::protocols::http::server::Session<()>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    )
+    where
+        F: FnOnce(h2::Codec<DuplexStream, Bytes>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = h2::Codec<DuplexStream, Bytes>> + Send,
+        C: FnOnce(&mut HttpSession),
+    {
         let (mut client, server) = duplex(65536);
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
 
@@ -686,11 +707,7 @@ mod test {
 
             let mut headers = Headers::new(
                 1.into(),
-                Pseudo::request(
-                    Method::POST,
-                    Uri::from_static("https://one.one.one.one/"),
-                    None,
-                ),
+                Pseudo::request(method, Uri::from_static("https://one.one.one.one/"), None),
                 HeaderMap::new(),
             );
             headers.set_end_headers();
@@ -715,10 +732,11 @@ mod test {
         .expect("accepting the stream failed")
         .expect("the connection ended before a stream arrived");
 
-        let session = match accepted {
+        let mut session = match accepted {
             H2Accept::Session(s) => s,
             H2Accept::Rejected => panic!("the request was rejected, not accepted"),
         };
+        configure(&mut session);
         // Wrap in the protocol-agnostic session. The timeout is set through
         // *that* API, because `HttpSession::set_read_timeout` dispatching to
         // the h2 arm is the thing a proxy actually relies on — reaching past
@@ -780,9 +798,9 @@ mod test {
     #[tokio::test]
     async fn test_h2_read_body_allows_a_slow_but_progressing_body() {
         let (mut session, _stop, _client) =
-            stream_expecting_a_body(Some(Duration::from_millis(300)), |mut codec| async move {
+            stream_expecting_a_body(Some(Duration::from_millis(500)), |mut codec| async move {
                 for _ in 0..4 {
-                    sleep(Duration::from_millis(150)).await;
+                    sleep(Duration::from_millis(100)).await;
                     let data = Data::new(1.into(), Bytes::from_static(b"xy"));
                     codec.send(data.into()).await.unwrap();
                 }
@@ -824,6 +842,115 @@ mod test {
             "the disconnect watch must outlive the read timeout, got {:?}",
             outcome.map(|r| r.map(|b| b.map(|b| b.len())))
         );
+    }
+
+    /// Once a CONNECT stream has been answered 2xx, its DATA frames are no
+    /// longer a request body — they are tunnel bytes, and a quiet tunnel is
+    /// normal. HTTP/1 already pends forever here rather than timing out
+    /// (`v1/server.rs`, `read_body_or_idle`); h2 must not differ, or every
+    /// idle tunnel dies at the read timeout.
+    #[tokio::test]
+    async fn test_h2_read_body_does_not_time_out_on_an_established_tunnel() {
+        let (mut session, _stop, _client) = stream_expecting_a_body_with(
+            Method::CONNECT,
+            Some(Duration::from_millis(200)),
+            |c| async { c },
+            |s| {
+                s.set_connect_tunnel_allowed(true);
+                let resp = Box::new(ResponseHeader::build(200, None).unwrap());
+                s.write_response_header(resp, false).unwrap();
+                assert!(s.was_upgraded(), "the test did not establish a tunnel");
+            },
+        )
+        .await;
+
+        let outcome =
+            pingora_timeout::timeout(Duration::from_millis(600), session.read_request_body()).await;
+
+        assert!(
+            outcome.is_err(),
+            "an established tunnel must not be cut by the read timeout, got {:?}",
+            outcome.map(|r| r.map(|b| b.map(|b| b.len())))
+        );
+    }
+
+    /// A CONNECT that has *not* been answered yet is still reading a request,
+    /// so it stays bounded — the tunnel exemption must not become a way to
+    /// opt out of the timeout by sending CONNECT.
+    #[tokio::test]
+    async fn test_h2_read_body_times_out_on_a_connect_before_the_tunnel_opens() {
+        let (mut session, _stop, _client) = stream_expecting_a_body_with(
+            Method::CONNECT,
+            Some(Duration::from_millis(200)),
+            |c| async { c },
+            |s| s.set_connect_tunnel_allowed(true),
+        )
+        .await;
+
+        let err = pingora_timeout::timeout(Duration::from_secs(5), session.read_request_body())
+            .await
+            .expect("the read hung instead of timing out")
+            .expect_err("an unanswered CONNECT must still be bounded");
+
+        assert_eq!(err.etype(), &pingora_error::ErrorType::ReadTimedout);
+    }
+
+    /// h1 has defaulted to a 60s read timeout since forever
+    /// (`v1/server.rs`). h2 defaulting to `None` would leave the hole open
+    /// for every caller that never sets one, which is most of them.
+    #[tokio::test]
+    async fn test_h2_read_timeout_defaults_to_the_same_value_as_h1() {
+        let (session, _stop, _client) =
+            stream_expecting_a_body(Some(Duration::from_millis(200)), |c| async { c }).await;
+        drop(session);
+
+        let (mut client, server) = duplex(65536);
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+            let mut headers = Headers::new(
+                1.into(),
+                Pseudo::request(
+                    Method::GET,
+                    Uri::from_static("https://one.one.one.one/"),
+                    None,
+                ),
+                HeaderMap::new(),
+            );
+            headers.set_end_headers();
+            headers.set_end_stream();
+            codec.send(headers.into()).await.unwrap();
+            while let Some(frame) = codec.next().await {
+                let _ = frame;
+            }
+        });
+
+        let mut conn = handshake(Box::new(server), None).await.unwrap();
+        let accepted = pingora_timeout::timeout(
+            Duration::from_secs(2),
+            HttpSession::from_h2_conn(&mut conn, Arc::new(Digest::default())),
+        )
+        .await
+        .expect("no stream arrived")
+        .expect("accept failed")
+        .expect("connection ended");
+        let session = match accepted {
+            H2Accept::Session(s) => s,
+            H2Accept::Rejected => panic!("rejected"),
+        };
+
+        assert_eq!(
+            session.get_read_timeout(),
+            Some(Duration::from_secs(60)),
+            "a fresh h2 session must carry the same default read timeout as h1"
+        );
+
+        client_handle.abort();
     }
 
     #[tokio::test]
