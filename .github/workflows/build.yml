@@ -72,7 +72,14 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
 
+      # One toolchain only. rustfmt's output drifts between nightlies, so
+      # running this across the matrix let an unrelated rustfmt change turn
+      # every PR red with no commit to the repo — which is what happened
+      # when a nightly started wanting a block comment's closing delimiter
+      # aligned. Formatting is checked against the toolchain the project
+      # pins, the same way clippy, audit and machete already are below.
       - name: Run cargo fmt
+        if: matrix.toolchain == '1.97.1'
         run: cargo fmt --all -- --check
 
       - name: Run cargo check
