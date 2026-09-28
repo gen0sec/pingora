@@ -379,6 +379,7 @@ impl Connector {
         settings.ping_interval = peer.h2_ping_interval();
         settings.stream_window_size = peer_options.and_then(|o| o.h2_stream_window_size);
         settings.connection_window_size = peer_options.and_then(|o| o.h2_connection_window_size);
+        settings.max_header_list_size = peer_options.and_then(|o| o.h2_max_header_list_size);
         let conn = handshake(stream, settings).await?;
         let h2_stream = conn.spawn_stream().await?.or_err(
             H2Error,
@@ -563,6 +564,16 @@ pub struct H2HandshakeSettings {
     /// Optional initial connection-level receive window size in bytes.
     /// If `None`, the default of 8MB is used.
     pub connection_window_size: Option<u32>,
+    /// Optional bound on the size of a response header list this client will
+    /// accept, advertised as SETTINGS_MAX_HEADER_LIST_SIZE.
+    ///
+    /// If `None`, h2's default of 16MB applies. The bound is enforced on
+    /// receive, not merely advertised: h2 applies it to its own decoder once
+    /// the peer ACKs the settings, and it also derives h2's CONTINUATION
+    /// frame budget. Note that h2 allows a multiple of this value before
+    /// failing the stream outright, so it is a bound on the order of
+    /// magnitude rather than an exact ceiling.
+    pub max_header_list_size: Option<u32>,
 }
 
 impl H2HandshakeSettings {
@@ -623,14 +634,21 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
     };
     let stream_window = settings.stream_window_size.unwrap_or(H2_WINDOW_SIZE);
     let conn_window = settings.connection_window_size.unwrap_or(H2_WINDOW_SIZE);
-    let (send_req, connection) = Builder::new()
+    let mut builder = Builder::new();
+    builder
         .enable_push(false)
         .initial_max_send_streams(max_streams)
         // The limit for the server. Server push is not allowed, so this value doesn't matter
         .max_concurrent_streams(1)
         .max_frame_size(64 * 1024) // advise server to send larger frames
         .initial_window_size(stream_window)
-        .initial_connection_window_size(conn_window)
+        .initial_connection_window_size(conn_window);
+    // Left alone when unset, so a caller that never asked for a bound keeps
+    // h2's default rather than acquiring one from this change.
+    if let Some(max) = settings.max_header_list_size {
+        builder.max_header_list_size(max);
+    }
+    let (send_req, connection) = builder
         .handshake(stream)
         .await
         .or_err(HandshakeError, "during H2 handshake")?;
@@ -1067,6 +1085,95 @@ mod tests {
             .unwrap();
 
         stream.read_response_header().await.unwrap();
+        assert_eq!(stream.response_header().unwrap().status, 200);
+    }
+
+    /// Serve one request and answer with a response carrying `header_bytes`
+    /// of header value, so a test can drive an oversized response header
+    /// list from the peer.
+    async fn serve_one_fat_response(server: tokio::io::DuplexStream, header_bytes: usize) {
+        let mut server_conn = h2::server::handshake(server).await.unwrap();
+        if let Some(result) = server_conn.accept().await {
+            let (_request, mut respond) = result.unwrap();
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("x-fat", "a".repeat(header_bytes))
+                .body(())
+                .unwrap();
+            if let Ok(mut stream) = respond.send_response(resp, false) {
+                let _ = stream.send_data(Bytes::from("ok"), true);
+            }
+        }
+        while let Some(_res) = server_conn.accept().await {}
+    }
+
+    /// An upstream response header list must be bounded.
+    ///
+    /// The connector configured push, stream counts, frame size and both
+    /// windows but never `max_header_list_size`, so h2's 16 MiB default
+    /// applied to every upstream — against the 64 KiB a proxy typically
+    /// enforces downstream. A compromised or impersonated backend could
+    /// spend that budget, and upstream TLS is often unauthenticated.
+    ///
+    /// The bound is real rather than advisory: h2 applies it to its own
+    /// decoder on SETTINGS ACK and fails the stream while decoding.
+    #[tokio::test]
+    async fn test_h2_upstream_rejects_an_oversized_response_header_list() {
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.max_header_list_size = Some(8 * 1024);
+
+        let (client, server) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(serve_one_fat_response(server, 256 * 1024));
+
+        let conn = handshake(Box::new(client), settings).await.unwrap();
+        let mut stream = conn.spawn_stream().await.unwrap().unwrap();
+        let mut request = RequestHeader::build("GET", b"/", None).unwrap();
+        request
+            .insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        stream
+            .write_request_header(Box::new(request), true)
+            .unwrap();
+
+        let got = stream.read_response_header().await;
+        assert!(
+            got.is_err(),
+            "a response header list far over the configured bound must not be \
+             accepted, got {:?}",
+            got.map(|_| stream.response_header().map(|h| h.status))
+        );
+    }
+
+    /// The control, and the claim this change makes to every other consumer
+    /// of the connector: leaving the setting unset keeps h2's own default, so
+    /// nothing that did not ask for a bound acquires one.
+    #[tokio::test]
+    async fn test_h2_upstream_header_list_is_unbounded_by_default() {
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        assert!(
+            settings.max_header_list_size.is_none(),
+            "the default must stay unset"
+        );
+
+        let (client, server) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(serve_one_fat_response(server, 256 * 1024));
+
+        let conn = handshake(Box::new(client), settings).await.unwrap();
+        let mut stream = conn.spawn_stream().await.unwrap().unwrap();
+        let mut request = RequestHeader::build("GET", b"/", None).unwrap();
+        request
+            .insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        stream
+            .write_request_header(Box::new(request), true)
+            .unwrap();
+
+        stream
+            .read_response_header()
+            .await
+            .expect("the same response must be accepted with no bound configured");
         assert_eq!(stream.response_header().unwrap().status, 200);
     }
 

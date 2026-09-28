@@ -529,6 +529,15 @@ pub struct PeerOptions {
     /// Initial connection-level H2 receive window size in bytes.
     /// If `None`, the default of 8MB is used.
     pub h2_connection_window_size: Option<u32>,
+    /// Bound on the size of a response header list accepted from this peer,
+    /// advertised as SETTINGS_MAX_HEADER_LIST_SIZE. `None` leaves h2's 16MB
+    /// default in place.
+    ///
+    /// Like the window sizes, this is deliberately excluded from
+    /// `reuse_hash`: it is a connection-level setting, so two peers that
+    /// differ only here share a pooled connection carrying whichever value
+    /// established it.
+    pub h2_max_header_list_size: Option<u32>,
     /// Allow a single invalid Content-Length in HTTP/1 responses (non-RFC compliant).
     ///
     /// When enabled, a response carrying a single, otherwise-unparseable
@@ -608,6 +617,7 @@ impl PeerOptions {
             max_h2_streams: 1,
             h2_stream_window_size: None,
             h2_connection_window_size: None,
+            h2_max_header_list_size: None,
             allow_h1_response_invalid_content_length: false,
             connect_tunnel: false,
             http_upstream_request_policy: HttpUpstreamRequestPolicy::default(),
