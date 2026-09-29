@@ -570,9 +570,19 @@ pub struct H2HandshakeSettings {
     /// If `None`, h2's default of 16MB applies. The bound is enforced on
     /// receive, not merely advertised: h2 applies it to its own decoder once
     /// the peer ACKs the settings, and it also derives h2's CONTINUATION
-    /// frame budget. Note that h2 allows a multiple of this value before
-    /// failing the stream outright, so it is a bound on the order of
-    /// magnitude rather than an exact ceiling.
+    /// frame budget.
+    ///
+    /// **How a violation fails depends on how far over it is, and the second
+    /// case is not stream-local.** Up to h2's abuse multiplier (4x) the
+    /// headers are dropped and the *stream* errors, leaving the connection
+    /// usable. Past that, h2 raises a *connection* error
+    /// (`ENHANCE_YOUR_CALM`, `header_list_way_too_large`) and the connection
+    /// is finished — so on a pooled, multiplexed upstream one hostile
+    /// response also fails every other request in flight on that connection.
+    ///
+    /// That is the trade this setting makes: a bounded blast radius on a
+    /// shared connection, instead of an unbounded header list. Set it with
+    /// that in mind rather than as a tight fit around expected traffic.
     pub max_header_list_size: Option<u32>,
 }
 
@@ -619,6 +629,16 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
                 "connection_window_size must be between 1 and {} (2^31-1)",
                 H2_MAX_WINDOW_SIZE
             ),
+        );
+    }
+
+    // Zero is not "no bound": it makes the abuse limit zero too, so the very
+    // first response on every connection to this peer is a connection error.
+    // Rejected here for the same reason the window sizes are.
+    if settings.max_header_list_size == Some(0) {
+        return Error::e_explain(
+            H2Error,
+            "max_header_list_size must be greater than 0; omit it for no bound",
         );
     }
 
@@ -1100,9 +1120,14 @@ mod tests {
                 .header("x-fat", "a".repeat(header_bytes))
                 .body(())
                 .unwrap();
-            if let Ok(mut stream) = respond.send_response(resp, false) {
-                let _ = stream.send_data(Bytes::from("ok"), true);
-            }
+            // Not `if let Ok(..)`: if a future h2 enforced the peer's
+            // advertised limit on send, the server would quietly send
+            // nothing and the oversize test would still see an error and
+            // pass, testing nothing.
+            let mut stream = respond
+                .send_response(resp, false)
+                .expect("the test server must be able to send the oversized response");
+            let _ = stream.send_data(Bytes::from("ok"), true);
         }
         while let Some(_res) = server_conn.accept().await {}
     }
@@ -1175,6 +1200,60 @@ mod tests {
             .await
             .expect("the same response must be accepted with no bound configured");
         assert_eq!(stream.response_header().unwrap().status, 200);
+    }
+
+    /// Within h2's abuse multiplier the failure is stream-local: the
+    /// headers are dropped and the stream errors, but the connection keeps
+    /// working. Pins the first half of the contract the doc comment states —
+    /// the other tests only ever drive the connection-error path, so without
+    /// this the documented distinction is untested.
+    #[tokio::test]
+    async fn test_h2_upstream_a_modest_overshoot_does_not_kill_the_connection() {
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.max_header_list_size = Some(8 * 1024);
+
+        let (client, server) = tokio::io::duplex(1024 * 1024);
+        // 2x the bound: over it, but inside the 4x abuse multiplier.
+        tokio::spawn(serve_one_fat_response(server, 16 * 1024));
+
+        let conn = handshake(Box::new(client), settings).await.unwrap();
+        let mut stream = conn.spawn_stream().await.unwrap().unwrap();
+        let mut request = RequestHeader::build("GET", b"/", None).unwrap();
+        request
+            .insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        stream
+            .write_request_header(Box::new(request), true)
+            .unwrap();
+
+        assert!(
+            stream.read_response_header().await.is_err(),
+            "the oversized response must still be refused"
+        );
+        assert!(
+            conn.spawn_stream().await.is_ok(),
+            "a modest overshoot must not take the shared connection down with it"
+        );
+    }
+
+    /// Zero is not "no bound" — it would make h2's abuse limit zero too, so
+    /// the first response on every connection to the peer becomes a
+    /// connection error. Rejected at handshake, like the window sizes.
+    #[tokio::test]
+    async fn test_h2_handshake_rejects_a_zero_header_list_size() {
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        settings.max_header_list_size = Some(0);
+        let (client, _server) = tokio::io::duplex(65536);
+        match handshake(Box::new(client), settings).await {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("max_header_list_size must be greater"),
+                "unexpected error: {e}"
+            ),
+            Ok(_) => panic!("expected max_header_list_size = 0 to be rejected"),
+        }
     }
 
     /// `spawn_stream()` must return `Ok(None)` when the server sends

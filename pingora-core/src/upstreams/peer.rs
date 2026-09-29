@@ -533,10 +533,9 @@ pub struct PeerOptions {
     /// advertised as SETTINGS_MAX_HEADER_LIST_SIZE. `None` leaves h2's 16MB
     /// default in place.
     ///
-    /// Like the window sizes, this is deliberately excluded from
-    /// `reuse_hash`: it is a connection-level setting, so two peers that
-    /// differ only here share a pooled connection carrying whichever value
-    /// established it.
+    /// Part of `reuse_hash`, unlike the window sizes: peers with different
+    /// bounds must not share a pooled connection, or the bound would apply
+    /// or not depending on which peer happened to establish it.
     pub h2_max_header_list_size: Option<u32>,
     /// Allow a single invalid Content-Length in HTTP/1 responses (non-RFC compliant).
     ///
@@ -815,6 +814,17 @@ impl Hash for HttpPeer {
         // from the reuse hash for now. These are per-connection settings applied at handshake
         // time and may be revisited alongside other h2 settings that could be dynamically
         // adjusted over the lifetime of a connection.
+        //
+        // h2_max_header_list_size is NOT excluded, though it is a
+        // per-connection handshake setting like those two. It is a limit
+        // rather than a tuning parameter, and sharing a pool across
+        // different values breaks it in both directions: a peer that asked
+        // for a bound silently gets none when an unbounded peer established
+        // the connection, and a peer that asked for none inherits a
+        // sibling's cap — which, past h2's abuse multiplier, kills the
+        // shared connection for everyone on it. A limit that applies or not
+        // depending on who connected first is not a limit.
+        self.options.h2_max_header_list_size.hash(state);
         self.options.curves.hash(state);
         self.options.second_keyshare.hash(state);
     }
@@ -918,6 +928,31 @@ impl Display for Proxy {
 
 #[cfg(test)]
 mod tests {
+
+    /// A bound that applies or not depending on which peer happened to
+    /// establish the pooled connection is not a bound. Peers differing only
+    /// in `h2_max_header_list_size` must not share one.
+    #[test]
+    fn peers_with_different_header_list_bounds_do_not_share_a_connection() {
+        let mut bounded = HttpPeer::new("1.1.1.1:443", true, "one.one.one.one".into());
+        bounded.options.h2_max_header_list_size = Some(64 * 1024);
+        let mut unbounded = HttpPeer::new("1.1.1.1:443", true, "one.one.one.one".into());
+        unbounded.options.h2_max_header_list_size = None;
+
+        assert_ne!(
+            bounded.reuse_hash(),
+            unbounded.reuse_hash(),
+            "a bounded peer must not reuse a connection established without the bound"
+        );
+
+        let mut same = HttpPeer::new("1.1.1.1:443", true, "one.one.one.one".into());
+        same.options.h2_max_header_list_size = Some(64 * 1024);
+        assert_eq!(
+            bounded.reuse_hash(),
+            same.reuse_hash(),
+            "identical peers must still pool together"
+        );
+    }
     use super::*;
 
     #[test]
