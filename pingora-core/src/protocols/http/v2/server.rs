@@ -28,7 +28,7 @@ use pingora_timeout::timeout;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::ready;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use crate::protocols::http::authority::{
@@ -146,19 +146,21 @@ pub(crate) async fn accept_downstream_sessions<F>(
     // `ActiveSessions` cannot tell "idle since the last stream" from "never
     // opened one" — both are a count of zero.
     let mut carried_a_stream = false;
+    // A *deadline*, fixed now, not a duration re-armed each time round the
+    // loop. `tokio::select!` rebuilds its futures on every iteration, so a
+    // duration here would restart on each `continue` — and a stream the
+    // codec rejects is a `continue`, which would let a client sending
+    // nothing but malformed HEADERS hold the connection for this bound
+    // multiplied by the malformed-stream budget.
+    let first_stream_deadline = timeouts
+        .first_stream
+        .or(timeouts.idle)
+        .map(|d| Instant::now() + d);
     // Per-connection budget for malformed streams (see MAX_MALFORMED_STREAMS_PER_CONN).
     let mut malformed_streams = 0usize;
     // In-flight sessions, decremented by the `StreamGuard` given to `on_session`.
     let active = Arc::new(ActiveSessions::new());
     loop {
-        // Before the first stream the connection has proved nothing about
-        // itself beyond completing a handshake, so it does not get the
-        // longer idle grace a working connection has earned.
-        let reap_after = if carried_a_stream {
-            timeouts.idle
-        } else {
-            timeouts.first_stream.or(timeouts.idle)
-        };
         let h2_stream = if shutdown_initiated {
             HttpSession::from_h2_conn_with_malformed_budget(
                 &mut conn,
@@ -185,10 +187,21 @@ pub(crate) async fn accept_downstream_sessions<F>(
                 // Any accepted stream cancels this future. The next iteration
                 // waits for all active streams to finish before starting a fresh
                 // idle period.
-                _ = wait_for_idle_timeout(&active, reap_after.unwrap_or_default()), if reap_after.is_some() => {
+                // After the first stream: an idle period that restarts each
+                // time the connection goes quiet again, which is what makes
+                // keepalive worth having.
+                _ = wait_for_idle_timeout(&active, timeouts.idle.unwrap_or_default()),
+                    if carried_a_stream && timeouts.idle.is_some() => {
                     // Idle with nothing in flight: drop `conn` to close the
                     // socket now (no graceful GOAWAY wait that could hang on
                     // a dead peer).
+                    return;
+                }
+                // Before it: a fixed deadline. The connection has proved
+                // nothing about itself beyond completing a handshake, and
+                // nothing it does short of opening a stream extends this.
+                _ = wait_for_deadline(&active, first_stream_deadline.unwrap_or_else(Instant::now)),
+                    if !carried_a_stream && first_stream_deadline.is_some() => {
                     return;
                 }
             }
@@ -225,21 +238,28 @@ pub(crate) async fn accept_downstream_sessions<F>(
 /// that, and holding it for the same duration is only a way to spend file
 /// descriptors.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct IdleReaping {
-    /// Applies once the connection has carried at least one stream.
-    /// `None` disables reaping.
-    pub idle: Option<Duration>,
+pub(crate) struct IdleReaping {
+    /// Applies once the connection has carried at least one stream, and
+    /// restarts each time it goes quiet again. `None` disables reaping *in
+    /// that phase* — it does not disable [`Self::first_stream`], which still
+    /// governs a connection that has not got that far.
+    pub(crate) idle: Option<Duration>,
     /// Applies until the first stream is accepted. `None` falls back to
     /// [`Self::idle`], which is the behaviour before this existed.
     ///
-    /// A stream the codec rejects as malformed does not count: answering a
-    /// protocol error is not evidence the connection is being used.
-    pub first_stream: Option<Duration>,
+    /// Unlike [`Self::idle`] this is a deadline from the start of the
+    /// connection rather than a period that restarts: a stream the codec
+    /// rejects as malformed neither promotes the connection to the idle
+    /// bound nor buys it more time against this one.
+    pub(crate) first_stream: Option<Duration>,
 }
 
 impl IdleReaping {
-    /// One bound for both phases — the pre-existing behaviour.
-    pub fn uniform(idle: Option<Duration>) -> Self {
+    /// One bound for both phases — the pre-existing behaviour. Only the
+    /// tests need to say this explicitly; production builds the struct from
+    /// the two server options.
+    #[cfg(test)]
+    pub(crate) fn uniform(idle: Option<Duration>) -> Self {
         Self {
             idle,
             first_stream: None,
@@ -291,6 +311,17 @@ async fn wait_for_idle_timeout(active: &ActiveSessions, idle_timeout: Duration) 
     active.wait_until_idle().await;
     if !idle_timeout.is_zero() {
         pingora_timeout::sleep(idle_timeout).await;
+    }
+}
+
+/// As [`wait_for_idle_timeout`], but against a fixed point in time, so that
+/// being rebuilt by `tokio::select!` on a later loop iteration does not
+/// grant a fresh period.
+async fn wait_for_deadline(active: &ActiveSessions, deadline: Instant) {
+    active.wait_until_idle().await;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        pingora_timeout::sleep(remaining).await;
     }
 }
 
