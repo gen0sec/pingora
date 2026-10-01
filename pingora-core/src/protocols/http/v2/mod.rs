@@ -355,7 +355,7 @@ mod test {
             connection,
             digest,
             shutdown_rx,
-            None,
+            server::IdleReaping::uniform(None),
             |mut session, _guard| {
                 session_handles.push(tokio::spawn(async move {
                     let req = session.req_header();
@@ -455,7 +455,7 @@ mod test {
             connection,
             digest,
             shutdown_rx,
-            None,
+            server::IdleReaping::uniform(None),
             |mut session, _guard| {
                 session_handles.push(tokio::spawn(async move {
                     let resp = Box::new(ResponseHeader::build(200, None).unwrap());
@@ -520,7 +520,7 @@ mod test {
                 connection,
                 digest,
                 shutdown_rx,
-                None,
+                server::IdleReaping::uniform(None),
                 |_session, _guard| {
                     panic!("did not expect any sessions on an idle connection");
                 },
@@ -566,7 +566,7 @@ mod test {
                 connection,
                 digest,
                 shutdown_rx,
-                Some(Duration::from_millis(100)),
+                server::IdleReaping::uniform(Some(Duration::from_millis(100))),
                 |_session, _guard| panic!("did not expect any sessions on an idle connection"),
             ),
         )
@@ -574,6 +574,128 @@ mod test {
         assert!(result.is_ok(), "idle timeout did not close the connection");
 
         client_handle.await.unwrap();
+    }
+
+    /// A connection that completes the handshake and opens nothing must be
+    /// reaped on the first-stream bound, not the much longer idle bound.
+    /// Without the distinction `idle` is the only reaper and this hangs.
+    #[tokio::test]
+    async fn test_h2_first_stream_timeout_closes_a_connection_that_opens_nothing() {
+        let (mut client, server) = duplex(65536);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+            while let Some(frame) = codec.next().await {
+                let _ = frame;
+            }
+        });
+
+        let connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        // The idle bound is an order of magnitude longer than the test's own
+        // ceiling, so passing proves the *first-stream* bound did the work.
+        let result = pingora_timeout::timeout(
+            Duration::from_secs(2),
+            server::accept_downstream_sessions(
+                connection,
+                digest,
+                shutdown_rx,
+                server::IdleReaping {
+                    idle: Some(Duration::from_secs(60)),
+                    first_stream: Some(Duration::from_millis(100)),
+                },
+                |_session, _guard| panic!("did not expect any sessions"),
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a connection that never opened a stream was not reaped"
+        );
+
+        client_handle.await.unwrap();
+    }
+
+    /// Control for the test above: once a stream has been carried, the short
+    /// first-stream bound must no longer apply, or every keepalive connection
+    /// would be closed between requests.
+    #[tokio::test]
+    async fn test_h2_first_stream_timeout_stops_applying_once_a_stream_is_carried() {
+        let (mut client, server) = duplex(65536);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+
+            let mut headers = Headers::new(
+                1.into(),
+                Pseudo::request(
+                    Method::GET,
+                    Uri::from_static("https://one.one.one.one/"),
+                    None,
+                ),
+                HeaderMap::new(),
+            );
+            headers.set_end_headers();
+            headers.set_end_stream();
+            codec.send(headers.into()).await.unwrap();
+
+            while let Some(frame) = codec.next().await {
+                let _ = frame;
+            }
+        });
+
+        let connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let (session_tx, session_rx) = oneshot::channel();
+        let mut session_tx = Some(session_tx);
+        let first_stream = Duration::from_millis(100);
+
+        let accept_handle = tokio::spawn(server::accept_downstream_sessions(
+            connection,
+            digest,
+            shutdown_rx,
+            server::IdleReaping {
+                idle: Some(Duration::from_secs(60)),
+                first_stream: Some(first_stream),
+            },
+            move |session, guard| {
+                let sent = session_tx
+                    .take()
+                    .expect("only one session should be accepted")
+                    .send((session, guard));
+                assert!(sent.is_ok(), "test must receive the accepted session");
+            },
+        ));
+
+        let session = pingora_timeout::timeout(Duration::from_secs(1), session_rx)
+            .await
+            .expect("session was not accepted")
+            .expect("accept loop dropped the session");
+        drop(session);
+
+        // Well past the first-stream bound, and far short of the idle one.
+        sleep(first_stream * 5).await;
+        assert!(
+            !accept_handle.is_finished(),
+            "the first-stream bound must not reap a connection that has served a stream"
+        );
+        accept_handle.abort();
+        client_handle.abort();
     }
 
     #[tokio::test]
@@ -618,7 +740,7 @@ mod test {
             connection,
             digest,
             shutdown_rx,
-            Some(idle_timeout),
+            server::IdleReaping::uniform(Some(idle_timeout)),
             move |session, guard| {
                 let sent = guard_tx
                     .take()
@@ -1044,7 +1166,7 @@ mod test {
                 connection,
                 digest,
                 shutdown_rx,
-                None,
+                server::IdleReaping::uniform(None),
                 |mut session, _guard| {
                     session_handles.push(tokio::spawn(async move {
                         let resp = Box::new(ResponseHeader::build(200, None).unwrap());

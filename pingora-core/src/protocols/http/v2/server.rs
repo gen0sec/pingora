@@ -102,7 +102,8 @@ pub async fn handshake(io: Stream, options: Option<H2Options>) -> Result<H2Conne
 ///   * the client closes the H2 connection cleanly ([`HttpSession::from_h2_conn`]
 ///     returns `Ok(None)` after the final GOAWAY is flushed),
 ///   * the codec hits a connection error, or
-///   * the configured idle timeout expires while no streams are active, or
+///   * the applicable [`IdleReaping`] bound expires while no streams are
+///     active, or
 ///   * the runtime-level `graceful_shutdown_timeout_seconds` ceiling fires and
 ///     force-kills the task driving this future.
 ///
@@ -134,17 +135,30 @@ pub(crate) async fn accept_downstream_sessions<F>(
     mut conn: H2Connection<Stream>,
     digest: Arc<Digest>,
     mut shutdown: ShutdownWatch,
-    idle_timeout: Option<Duration>,
+    timeouts: IdleReaping,
     mut on_session: F,
 ) where
     F: FnMut(HttpSession, StreamGuard),
 {
     let mut shutdown_initiated = false;
+    // Whether this connection has ever carried a real stream. A connection
+    // that has not is reaped on `IdleReaping::first_stream` instead, because
+    // `ActiveSessions` cannot tell "idle since the last stream" from "never
+    // opened one" — both are a count of zero.
+    let mut carried_a_stream = false;
     // Per-connection budget for malformed streams (see MAX_MALFORMED_STREAMS_PER_CONN).
     let mut malformed_streams = 0usize;
     // In-flight sessions, decremented by the `StreamGuard` given to `on_session`.
     let active = Arc::new(ActiveSessions::new());
     loop {
+        // Before the first stream the connection has proved nothing about
+        // itself beyond completing a handshake, so it does not get the
+        // longer idle grace a working connection has earned.
+        let reap_after = if carried_a_stream {
+            timeouts.idle
+        } else {
+            timeouts.first_stream.or(timeouts.idle)
+        };
         let h2_stream = if shutdown_initiated {
             HttpSession::from_h2_conn_with_malformed_budget(
                 &mut conn,
@@ -171,7 +185,7 @@ pub(crate) async fn accept_downstream_sessions<F>(
                 // Any accepted stream cancels this future. The next iteration
                 // waits for all active streams to finish before starting a fresh
                 // idle period.
-                _ = wait_for_idle_timeout(&active, idle_timeout.unwrap_or_default()), if idle_timeout.is_some() => {
+                _ = wait_for_idle_timeout(&active, reap_after.unwrap_or_default()), if reap_after.is_some() => {
                     // Idle with nothing in flight: drop `conn` to close the
                     // socket now (no graceful GOAWAY wait that could hang on
                     // a dead peer).
@@ -192,8 +206,43 @@ pub(crate) async fn accept_downstream_sessions<F>(
             // connection alive and continue accepting sibling streams.
             Ok(Some(H2Accept::Rejected)) => continue,
             Ok(Some(H2Accept::Session(session))) => {
+                carried_a_stream = true;
                 on_session(session, active.start_session());
             }
+        }
+    }
+}
+
+/// When [`accept_downstream_sessions`] reaps a downstream HTTP/2 connection
+/// that has no streams in flight.
+///
+/// Two bounds rather than one because "idle" covers two different things.
+/// A connection that has served requests and is being held open for the
+/// next one is worth keeping — closing it costs a fresh TCP and TLS
+/// handshake, and HTTP/2 clients keep channels warm with PINGs, which open
+/// no stream and so leave the connection idle by this measure. A connection
+/// that completed the handshake and never opened a stream has shown none of
+/// that, and holding it for the same duration is only a way to spend file
+/// descriptors.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IdleReaping {
+    /// Applies once the connection has carried at least one stream.
+    /// `None` disables reaping.
+    pub idle: Option<Duration>,
+    /// Applies until the first stream is accepted. `None` falls back to
+    /// [`Self::idle`], which is the behaviour before this existed.
+    ///
+    /// A stream the codec rejects as malformed does not count: answering a
+    /// protocol error is not evidence the connection is being used.
+    pub first_stream: Option<Duration>,
+}
+
+impl IdleReaping {
+    /// One bound for both phases — the pre-existing behaviour.
+    pub fn uniform(idle: Option<Duration>) -> Self {
+        Self {
+            idle,
+            first_stream: None,
         }
     }
 }

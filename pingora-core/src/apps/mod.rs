@@ -97,8 +97,24 @@ pub struct HttpServerOptions {
     /// If set, close a downstream HTTP/2 connection that has been idle
     /// for this duration.
     ///
+    /// Applies once the connection has carried at least one stream; see
+    /// [`h2_first_stream_timeout`](Self::h2_first_stream_timeout) for the
+    /// period before that.
+    ///
     /// Default: `None`
     pub h2_idle_timeout: Option<Duration>,
+
+    /// If set, close a downstream HTTP/2 connection that completed the
+    /// handshake and has not opened a single stream within this duration.
+    ///
+    /// Separate from [`h2_idle_timeout`](Self::h2_idle_timeout) because the
+    /// two periods deserve different answers: a warm connection between
+    /// requests is worth holding, one that has never been used is not. With
+    /// a single bound, loosening it for the first case loosens it for the
+    /// second, and nothing else reaps a connection that opens no stream.
+    ///
+    /// Default: `None`, which falls back to `h2_idle_timeout`.
+    pub h2_first_stream_timeout: Option<Duration>,
 }
 
 /// Settings persisted across HTTP/1.x keepalive requests on the same downstream connection.
@@ -340,12 +356,17 @@ where
             // the same code path is exercised by tests in `protocols::http::v2`.
             let app = self.clone();
             let shutdown_for_session = shutdown.clone();
-            let h2_idle_timeout = self.server_options().and_then(|o| o.h2_idle_timeout);
+            let timeouts = server::IdleReaping {
+                idle: self.server_options().and_then(|o| o.h2_idle_timeout),
+                first_stream: self
+                    .server_options()
+                    .and_then(|o| o.h2_first_stream_timeout),
+            };
             server::accept_downstream_sessions(
                 h2_conn,
                 digest,
                 shutdown.clone(),
-                h2_idle_timeout,
+                timeouts,
                 |h2_stream, guard| {
                     let app = app.clone();
                     let shutdown = shutdown_for_session.clone();
