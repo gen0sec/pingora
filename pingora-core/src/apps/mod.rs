@@ -113,6 +113,13 @@ pub struct HttpServerOptions {
     /// a single bound, loosening it for the first case loosens it for the
     /// second, and nothing else reaps a connection that opens no stream.
     ///
+    /// Choose it with preconnection in mind. A browser acting on a
+    /// `preconnect` hint, a client warming a gRPC channel, and HTTP/2
+    /// connection coalescing all complete a handshake and may legitimately
+    /// open no stream for some seconds. Set too short, this reaps exactly
+    /// those and forces the handshake they existed to avoid; it is a bound
+    /// on how long an *unused* connection may sit, not a liveness check.
+    ///
     /// Default: `None`, which falls back to `h2_idle_timeout`.
     pub h2_first_stream_timeout: Option<Duration>,
 }

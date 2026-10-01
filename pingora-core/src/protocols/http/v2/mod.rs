@@ -624,6 +624,83 @@ mod test {
         client_handle.await.unwrap();
     }
 
+    /// The first-stream bound is a deadline from the start of the
+    /// connection, not a duration re-armed on every loop iteration. A
+    /// client that keeps the accept loop busy with streams the codec
+    /// rejects must still be reaped on time: each rejection is a `continue`,
+    /// and `tokio::select!` rebuilds its futures each time round.
+    #[tokio::test]
+    async fn test_h2_first_stream_timeout_is_not_restarted_by_a_rejected_stream() {
+        let (mut client, server) = duplex(65536);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let first_stream = Duration::from_millis(300);
+
+        let client_handle = tokio::spawn(async move {
+            client
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await
+                .unwrap();
+            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
+            codec.send(Settings::default().into()).await.unwrap();
+            codec.send(Settings::ack().into()).await.unwrap();
+
+            // A control byte in `:path` is rejected at the stream level, so
+            // the accept loop sees `H2Accept::Rejected` and continues. Stay
+            // under MAX_MALFORMED_STREAMS_PER_CONN so the budget is not what
+            // ends the connection.
+            for id in (1..=21u32).step_by(2) {
+                let pseudo = Pseudo::request(
+                    Method::GET,
+                    Uri::from_static("https://one.one.one.one/"),
+                    None,
+                );
+                // Conflicting Content-Length is an unrecoverable framing
+                // error, reset at the stream level. h2 passes it through, so
+                // unlike a control byte in `:path` it really does reach the
+                // accept loop as `H2Accept::Rejected`.
+                let mut map = HeaderMap::new();
+                map.append("content-length", "10".parse().unwrap());
+                map.append("content-length", "20".parse().unwrap());
+                let mut headers = Headers::new(id.into(), pseudo, map);
+                headers.set_end_headers();
+                if codec.send(headers.into()).await.is_err() {
+                    return;
+                }
+                sleep(first_stream / 4).await;
+            }
+            while let Some(frame) = codec.next().await {
+                let _ = frame;
+            }
+        });
+
+        let connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        // 11 rejections at a quarter of the bound each span well over it. If
+        // the deadline restarts on each one the loop runs for ~2.9s and this
+        // times out; held from the start it returns at ~300ms.
+        let result = pingora_timeout::timeout(
+            first_stream * 3,
+            server::accept_downstream_sessions(
+                connection,
+                digest,
+                shutdown_rx,
+                server::IdleReaping {
+                    idle: Some(Duration::from_secs(60)),
+                    first_stream: Some(first_stream),
+                },
+                |_session, _guard| panic!("a rejected stream must not be accepted"),
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a rejected stream restarted the first-stream deadline"
+        );
+
+        client_handle.abort();
+    }
+
     /// Control for the test above: once a stream has been carried, the short
     /// first-stream bound must no longer apply, or every keepalive connection
     /// would be closed between requests.
