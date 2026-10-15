@@ -902,6 +902,7 @@ mod listen_address_tests {
 
     #[test]
     fn unknown_service_disables_inherited_fd_cleanup() {
+        let _guard = crate::protocols::proxy_protocol::GLOBALS_TEST_LOCK.blocking_lock();
         let mut server = Server::new_with_opt_and_conf(None, ServerConf::default());
         server.bootstrap_as_a_service();
         assert_eq!(server.collect_listen_addresses(), Some(Default::default()));
