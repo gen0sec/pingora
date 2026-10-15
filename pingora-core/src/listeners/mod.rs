@@ -824,9 +824,55 @@ mod test {
     use super::*;
     #[cfg(feature = "connection_filter")]
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     #[cfg(feature = "any_tls")]
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn a_half_proxy_header_fails_the_handshake_and_closes_the_socket() {
+        use crate::protocols::proxy_protocol as pp;
+        use tokio::io::AsyncReadExt;
+
+        let _guard = pp::GLOBALS_TEST_LOCK.lock().await;
+        let was_enabled = pp::proxy_protocol_enabled();
+        let was_bound = pp::proxy_protocol_header_timeout();
+        pp::set_proxy_protocol_enabled(true);
+        pp::set_proxy_protocol_header_timeout(Some(Duration::from_millis(200)));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"PROXY TCP4 203.0.113.62 10.0.")
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let uninit = UninitializedStream {
+            l4: socket.into(),
+            tls: None,
+            l4_buffer: L4BufferSettings::default(),
+            pre_tls_callback: None,
+        };
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(5), uninit.handshake())
+            .await
+            .expect("the handshake must not wait for the peer");
+        let elapsed = started.elapsed();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf)).await;
+
+        pp::set_proxy_protocol_enabled(was_enabled);
+        pp::set_proxy_protocol_header_timeout(was_bound);
+
+        let err = result.expect_err("a half header must fail the handshake");
+        assert_eq!(err.etype(), &ReadTimedout, "{err}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        match read.expect("the server must close the socket") {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("unexpected {n} bytes"),
+        }
+    }
 
     #[tokio::test]
     async fn test_listen_tcp() {
