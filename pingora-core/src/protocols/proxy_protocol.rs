@@ -18,7 +18,8 @@ use bytes::Bytes;
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType, OrErr, Result};
 use std::net::SocketAddr as StdSocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 use crate::protocols::l4::stream::Stream;
@@ -51,6 +52,26 @@ pub fn set_proxy_protocol_enabled(enable: bool) {
 /// Check whether global PROXY protocol parsing is enabled.
 pub fn proxy_protocol_enabled() -> bool {
     PROXY_PROTOCOL_ENABLED.load(Ordering::Relaxed)
+}
+
+static PROXY_PROTOCOL_HEADER_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Bound the wait for a PROXY protocol header on every downstream connection.
+///
+/// `None` (the default) leaves the wait unbounded. A bound shorter than 1 ms is rounded up to 1 ms.
+pub fn set_proxy_protocol_header_timeout(t: Option<Duration>) {
+    let ms = t.map_or(0, |d| {
+        u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)
+    });
+    PROXY_PROTOCOL_HEADER_TIMEOUT_MS.store(ms, Ordering::Relaxed);
+}
+
+/// The bound set by [`set_proxy_protocol_header_timeout`], or `None` when unbounded.
+pub fn proxy_protocol_header_timeout() -> Option<Duration> {
+    match PROXY_PROTOCOL_HEADER_TIMEOUT_MS.load(Ordering::Relaxed) {
+        0 => None,
+        ms => Some(Duration::from_millis(ms)),
+    }
 }
 
 /// Extract the real client address from a parsed PROXY protocol header when available.
@@ -191,6 +212,28 @@ fn detect_v2(data: &[u8]) -> ProxyDetection {
     ProxyDetection::HeaderLength(total_len)
 }
 
+/// Like [`consume_proxy_header`], but gives up after `bound` when it is `Some`.
+///
+/// # Errors
+/// Returns a `ReadTimedout` error when the header is not complete within `bound`, plus
+/// every error [`consume_proxy_header`] returns.
+pub async fn consume_proxy_header_within(
+    stream: &mut Stream,
+    bound: Option<Duration>,
+) -> Result<Option<ProxyHeader>> {
+    match bound {
+        None => consume_proxy_header(stream).await,
+        Some(bound) => tokio::time::timeout(bound, consume_proxy_header(stream))
+            .await
+            .unwrap_or_else(|_| {
+                Error::e_explain(
+                    ErrorType::ReadTimedout,
+                    "while waiting for the PROXY protocol header",
+                )
+            }),
+    }
+}
+
 /// Consume and parse a PROXY protocol header from the provided transport stream if present.
 ///
 /// If the stream does not start with a PROXY header, the bytes that were read for detection are
@@ -312,6 +355,84 @@ mod tests {
             detect_proxy_header(&header),
             ProxyDetection::HeaderLength(header.len())
         );
+    }
+
+    #[tokio::test]
+    async fn a_half_header_times_out_within_the_bound() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let writer = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(b"PROXY TCP4 203.0.113.62 10.0.")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut stream: Stream = socket.into();
+
+        let started = std::time::Instant::now();
+        let err = consume_proxy_header_within(&mut stream, Some(Duration::from_millis(200)))
+            .await
+            .expect_err("a half header must not parse");
+        assert_eq!(err.etype(), &ErrorType::ReadTimedout, "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn a_header_that_arrives_within_the_bound_is_parsed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let writer = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client
+                .write_all(b"PROXY TCP4 203.0.113.10 198.51.100.5 54321 443\r\nHELLO")
+                .await
+                .unwrap();
+        });
+
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut stream: Stream = socket.into();
+
+        let header = consume_proxy_header_within(&mut stream, Some(Duration::from_secs(1)))
+            .await
+            .expect("header within the bound should parse");
+        assert!(header.is_some());
+
+        let mut rest = [0u8; 5];
+        stream.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"HELLO");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_bound_means_the_old_behaviour() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let writer = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            client
+                .write_all(b"PROXY TCP4 203.0.113.10 198.51.100.5 54321 443\r\nHELLO")
+                .await
+                .unwrap();
+        });
+
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut stream: Stream = socket.into();
+
+        let header = consume_proxy_header_within(&mut stream, None)
+            .await
+            .expect("unbounded read should parse");
+        assert!(header.is_some());
+        writer.await.unwrap();
     }
 
     #[tokio::test]
