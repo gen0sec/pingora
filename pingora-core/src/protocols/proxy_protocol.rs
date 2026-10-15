@@ -58,11 +58,13 @@ static PROXY_PROTOCOL_HEADER_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Bound the wait for a PROXY protocol header on every downstream connection.
 ///
-/// `None` (the default) leaves the wait unbounded. A bound shorter than 1 ms is rounded up to 1 ms.
+/// `None` (the default) and `Some(Duration::ZERO)` leave the wait unbounded. A non-zero bound
+/// shorter than 1 ms is rounded up to 1 ms.
 pub fn set_proxy_protocol_header_timeout(t: Option<Duration>) {
-    let ms = t.map_or(0, |d| {
-        u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)
-    });
+    let ms = match t {
+        Some(d) if !d.is_zero() => u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1),
+        _ => 0,
+    };
     PROXY_PROTOCOL_HEADER_TIMEOUT_MS.store(ms, Ordering::Relaxed);
 }
 
@@ -73,6 +75,10 @@ pub fn proxy_protocol_header_timeout() -> Option<Duration> {
         ms => Some(Duration::from_millis(ms)),
     }
 }
+
+/// Serialises tests that change the PROXY protocol process globals.
+#[cfg(test)]
+pub(crate) static GLOBALS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Extract the real client address from a parsed PROXY protocol header when available.
 pub fn source_addr_from_header(header: &ProxyHeader) -> Option<StdSocketAddr> {
@@ -433,6 +439,58 @@ mod tests {
             .expect("unbounded read should parse");
         assert!(header.is_some());
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_trickled_header_times_out_on_the_total_not_per_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let writer = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let line = b"PROXY TCP4 203.0.113.10 198.51.100.5 54321 443\r\n";
+            for chunk in line.chunks(5) {
+                if client.write_all(chunk).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+        });
+
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut stream: Stream = socket.into();
+
+        let started = std::time::Instant::now();
+        let err = consume_proxy_header_within(&mut stream, Some(Duration::from_millis(300)))
+            .await
+            .expect_err("a trickled header must hit the total bound");
+        assert_eq!(err.etype(), &ErrorType::ReadTimedout, "{err}");
+        assert!(started.elapsed() < Duration::from_millis(800));
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn the_header_timeout_defaults_to_none_and_round_trips() {
+        let _guard = GLOBALS_TEST_LOCK.lock().await;
+        let previous = proxy_protocol_header_timeout();
+        assert_eq!(previous, None, "nothing sets a bound by default");
+
+        set_proxy_protocol_header_timeout(None);
+        assert_eq!(proxy_protocol_header_timeout(), None);
+        set_proxy_protocol_header_timeout(Some(Duration::from_millis(250)));
+        assert_eq!(
+            proxy_protocol_header_timeout(),
+            Some(Duration::from_millis(250))
+        );
+        set_proxy_protocol_header_timeout(Some(Duration::from_micros(500)));
+        assert_eq!(
+            proxy_protocol_header_timeout(),
+            Some(Duration::from_millis(1))
+        );
+        set_proxy_protocol_header_timeout(Some(Duration::ZERO));
+        assert_eq!(proxy_protocol_header_timeout(), None);
+
+        set_proxy_protocol_header_timeout(previous);
     }
 
     #[tokio::test]

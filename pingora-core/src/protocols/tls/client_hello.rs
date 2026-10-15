@@ -926,6 +926,7 @@ mod tests {
 
     #[test]
     fn test_parse_client_hello_with_proxy_protocol_v1() {
+        let _guard = crate::protocols::proxy_protocol::GLOBALS_TEST_LOCK.blocking_lock();
         // PROXY protocol v1 header followed by ClientHello
         let proxy_header = b"PROXY TCP4 203.0.113.10 198.51.100.5 54321 443\r\n";
 
@@ -975,6 +976,7 @@ mod tests {
 
     #[test]
     fn test_parse_client_hello_without_proxy_protocol() {
+        let _guard = crate::protocols::proxy_protocol::GLOBALS_TEST_LOCK.blocking_lock();
         // ClientHello without PROXY protocol header
         let client_hello = vec![
             0x16, // Content Type: Handshake
