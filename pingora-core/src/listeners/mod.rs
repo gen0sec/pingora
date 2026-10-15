@@ -565,7 +565,12 @@ impl UninitializedStream {
             .map(|a| format!("{}", a))
             .unwrap_or_else(|| "unknown".to_string());
 
-        match proxy_protocol::consume_proxy_header(&mut self.l4).await {
+        match proxy_protocol::consume_proxy_header_within(
+            &mut self.l4,
+            proxy_protocol::proxy_protocol_header_timeout(),
+        )
+        .await
+        {
             Ok(Some(header)) => {
                 let real_addr_opt = proxy_protocol::source_addr_from_header(&header);
                 if let Some(real_addr) = real_addr_opt {
@@ -602,6 +607,13 @@ impl UninitializedStream {
             }
             Ok(None) => {
                 debug!("PROXY protocol is enabled but downstream connection from {} sent no header (connection will continue)", peer_str);
+            }
+            Err(e) if e.etype() == &ReadTimedout => {
+                debug!(
+                    "PROXY protocol header from {} not received in time, closing",
+                    peer_str
+                );
+                return Err(e);
             }
             Err(e) => {
                 // PROXY protocol parsing failed - this could be due to connection reset
