@@ -536,6 +536,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bracketed_ipv4_sni_sends_no_sni_and_matches_ip_san() {
+        let (cert, key) = fixture("ip_san");
+        let o = try_connect(&cert, &key, "[127.0.0.1]", |_| {}).await;
+        assert!(o.ok(), "{:?}", o.err);
+        o.assert_no_sni();
+    }
+
+    #[tokio::test]
     async fn bracketed_ipv6_sni_sends_no_sni_and_matches_ip_san() {
         let (cert, key) = fixture("ip_san_v6");
         let Some(o) = try_connect_on("::1", &cert, &key, "[::1]", |_| {}).await else {
