@@ -146,8 +146,9 @@ impl Connector {
     }
 }
 
-/// The IP address `sni` spells, if any. RFC 6066 forbids IP literals in SNI; the TLS
-/// library already leaves the extension out for them.
+/// The IP address `sni` spells, if any, with or without brackets. RFC 6066 forbids IP
+/// literals in SNI, so the caller turns the extension off for them: the TLS library only
+/// skips it for the unbracketed forms.
 fn sni_ip_literal(sni: &str) -> Option<IpAddr> {
     let bare = sni
         .strip_prefix('[')
@@ -208,6 +209,11 @@ where
         ssl_use_second_key_share(&mut ssl_conf, false);
     }
 
+    let sni_ip = sni_ip_literal(peer.sni()).map(|ip| ip.to_canonical());
+    if sni_ip.is_some() {
+        ssl_conf.set_use_server_name_indication(false);
+    }
+
     // disable verification if sni does not exist
     // XXX: verify on empty string cause null string seg fault
     if peer.sni().is_empty() {
@@ -218,7 +224,11 @@ where
     } else if peer.verify_cert() {
         if peer.verify_hostname() {
             let verify_param = ssl_conf.param_mut();
-            if let Some(ip) = sni_ip_literal(peer.sni()) {
+            let has_alt_cn = peer.alternative_cn().is_some_and(|a| !a.is_empty());
+            // OpenSSL checks the IP and the host list independently, so set_ip together
+            // with alt_cn would demand both. With alt_cn the host list (IP string plus
+            // alt_cn) is kept and IP SANs are not matched.
+            if let (Some(ip), false) = (sni_ip, has_alt_cn) {
                 // An IP literal is checked against IP SANs; add_host only matches DNS names.
                 verify_param
                     .set_ip(ip)
@@ -310,6 +320,10 @@ mod tests {
                 &include_bytes!("../../../../tests/certs/ip_literal/dns_backend.crt")[..],
                 &include_bytes!("../../../../tests/certs/ip_literal/dns_backend.key")[..],
             ),
+            "ip_san_v6" => (
+                &include_bytes!("../../../../tests/certs/ip_literal/ip_san_v6.crt")[..],
+                &include_bytes!("../../../../tests/certs/ip_literal/ip_san_v6.key")[..],
+            ),
             _ => unreachable!(),
         };
         (
@@ -318,19 +332,26 @@ mod tests {
         )
     }
 
-    /// Serves one TLS handshake; returns the port and the SNI the server saw.
-    fn serve_once(cert: &X509, key: &PKey<Private>) -> (u16, Arc<Mutex<Option<String>>>) {
+    /// Serves one TLS handshake on `bind`; returns the port and what the servername
+    /// callback saw: `None` if it never ran, `Some(None)` if it ran without an SNI.
+    #[allow(clippy::type_complexity)]
+    fn serve_once(
+        bind: &str,
+        cert: &X509,
+        key: &PKey<Private>,
+    ) -> Option<(u16, Arc<Mutex<Option<Option<String>>>>)> {
         let seen = Arc::new(Mutex::new(None));
         let seen_cb = seen.clone();
         let mut acc = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
         acc.set_certificate(cert).unwrap();
         acc.set_private_key(key).unwrap();
         acc.set_servername_callback(move |ssl, _| {
-            *seen_cb.lock().unwrap() = ssl.servername(NameType::HOST_NAME).map(str::to_string);
+            *seen_cb.lock().unwrap() =
+                Some(ssl.servername(NameType::HOST_NAME).map(str::to_string));
             Ok(())
         });
         let acc = acc.build();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = std::net::TcpListener::bind(bind).ok()?;
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             if let Ok((s, _)) = listener.accept() {
@@ -339,63 +360,200 @@ mod tests {
                 }
             }
         });
-        (port, seen)
+        Some((port, seen))
+    }
+
+    struct Outcome {
+        err: Option<String>,
+        /// The X509 verify error the client's verify callback saw.
+        verify_err: Option<String>,
+        /// `None`: the servername callback never ran.
+        sni_seen: Option<Option<String>>,
+    }
+
+    impl Outcome {
+        fn ok(&self) -> bool {
+            self.err.is_none()
+        }
+        /// Asserts the server's callback ran and saw no SNI extension.
+        fn assert_no_sni(&self) {
+            assert_eq!(
+                self.sni_seen,
+                Some(None),
+                "callback must run and see no SNI"
+            );
+        }
     }
 
     /// Connects to a server presenting `cert`, with `sni` as the peer name.
-    async fn try_connect(cert: &X509, key: &PKey<Private>, sni: &str) -> (bool, Option<String>) {
-        let (port, seen) = serve_once(cert, key);
-        let mut peer = HttpPeer::new(format!("127.0.0.1:{port}"), true, sni.to_string());
+    async fn try_connect(
+        cert: &X509,
+        key: &PKey<Private>,
+        sni: &str,
+        tweak: impl FnOnce(&mut HttpPeer),
+    ) -> Outcome {
+        try_connect_on("127.0.0.1", cert, key, sni, tweak)
+            .await
+            .unwrap()
+    }
+
+    async fn try_connect_on(
+        host: &str,
+        cert: &X509,
+        key: &PKey<Private>,
+        sni: &str,
+        tweak: impl FnOnce(&mut HttpPeer),
+    ) -> Option<Outcome> {
+        let (port, seen) = serve_once(&format!("{host}:0"), cert, key)?;
+        let addr = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        let mut peer = HttpPeer::new(addr, true, sni.to_string());
         peer.options.ca = Some(Arc::new(vec![cert.clone()].into_boxed_slice()));
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        let connector = Connector::new(None);
-        let ok = connect(Stream::from(tcp), &peer, None, &connector.ctx)
-            .await
-            .is_ok();
+        tweak(&mut peer);
+        let tcp = tokio::net::TcpStream::connect((host, port)).await.unwrap();
+        let verify_err = Arc::new(Mutex::new(None));
+        let verify_err_cb = verify_err.clone();
+        let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+        builder.set_verify_callback(SslVerifyMode::PEER, move |ok, ctx| {
+            if !ok {
+                verify_err_cb
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| verify_error_text(ctx));
+            }
+            ok
+        });
+        let ctx = builder.build();
+        let res = connect(Stream::from(tcp), &peer, None, &ctx).await;
         let sni_seen = seen.lock().unwrap().clone();
-        (ok, sni_seen)
+        let verify_err = verify_err.lock().unwrap().clone();
+        Some(Outcome {
+            err: res.err().map(|e| e.to_string()),
+            verify_err,
+            sni_seen,
+        })
+    }
+
+    #[cfg(not(feature = "boringssl"))]
+    fn verify_error_text(ctx: &crate::tls::x509::X509StoreContextRef) -> String {
+        ctx.error().error_string().to_string()
+    }
+
+    // boring's X509StoreContextRef has no error getter: the reason cannot be read there.
+    #[cfg(feature = "boringssl")]
+    fn verify_error_text(_: &crate::tls::x509::X509StoreContextRef) -> String {
+        String::new()
+    }
+
+    fn assert_rejected(o: &Outcome, what: &str) {
+        assert!(o.err.is_some(), "handshake must fail");
+        if cfg!(not(feature = "boringssl")) {
+            assert_eq!(o.verify_err.as_deref(), Some(what));
+        }
+    }
+
+    #[test]
+    fn sni_ip_literal_forms() {
+        let ip = |s: &str| s.parse::<IpAddr>().ok();
+        assert_eq!(sni_ip_literal("::1"), ip("::1"));
+        assert_eq!(sni_ip_literal("[::1]"), ip("::1"));
+        assert_eq!(sni_ip_literal("127.0.0.1"), ip("127.0.0.1"));
+        assert_eq!(sni_ip_literal("[127.0.0.1]"), ip("127.0.0.1"));
+        assert_eq!(sni_ip_literal("fe80::1%eth0"), None);
+        assert_eq!(sni_ip_literal("host"), None);
+        assert_eq!(sni_ip_literal("::ffff:10.0.0.5"), ip("::ffff:10.0.0.5"));
     }
 
     #[tokio::test]
     async fn ip_sni_matches_ip_san() {
         let (cert, key) = fixture("ip_san");
-        let (ok, sni) = try_connect(&cert, &key, "127.0.0.1").await;
-        assert!(ok, "IP SAN must verify an IP-literal upstream");
-        assert_eq!(sni, None, "no SNI for an IP literal");
+        let o = try_connect(&cert, &key, "127.0.0.1", |_| {}).await;
+        assert!(
+            o.ok(),
+            "IP SAN must verify an IP-literal upstream: {:?}",
+            o.err
+        );
+        o.assert_no_sni();
     }
 
     #[tokio::test]
     async fn ip_sni_matches_ip_san_with_dns_san_too() {
         let (cert, key) = fixture("ip_and_dns_san");
-        let (ok, _) = try_connect(&cert, &key, "127.0.0.1").await;
-        assert!(ok);
+        let o = try_connect(&cert, &key, "127.0.0.1", |_| {}).await;
+        assert!(o.ok(), "{:?}", o.err);
     }
 
     #[tokio::test]
     async fn ip_sni_rejects_dns_only_cert() {
         let (cert, key) = fixture("dns_only");
-        let (ok, sni) = try_connect(&cert, &key, "127.0.0.1").await;
-        assert!(!ok, "a DNS SAN must not satisfy an IP-literal upstream");
-        assert_eq!(sni, None);
+        let o = try_connect(&cert, &key, "127.0.0.1", |_| {}).await;
+        assert_rejected(&o, "IP address mismatch");
+        o.assert_no_sni();
     }
 
     #[tokio::test]
     async fn ip_sni_rejects_wrong_ip() {
         let (cert, key) = fixture("other_ip");
-        let (ok, _) = try_connect(&cert, &key, "127.0.0.1").await;
-        assert!(!ok);
+        let o = try_connect(&cert, &key, "127.0.0.1", |_| {}).await;
+        assert_rejected(&o, "IP address mismatch");
+    }
+
+    #[tokio::test]
+    async fn ip_sni_without_hostname_verification_accepts_other_ip() {
+        let (cert, key) = fixture("other_ip");
+        let o = try_connect(&cert, &key, "127.0.0.1", |p| {
+            p.options.verify_hostname = false
+        })
+        .await;
+        assert!(o.ok(), "{:?}", o.err);
+        o.assert_no_sni();
+    }
+
+    // With alternative_cn the host list (IP string plus alt_cn) is used and IP SANs are
+    // not consulted, so OpenSSL's independent IP check is not added on top of it.
+    #[tokio::test]
+    async fn ip_sni_with_alternative_cn_matches_dns_cert() {
+        let (cert, key) = fixture("dns_backend");
+        let o = try_connect(&cert, &key, "127.0.0.1", |p| {
+            p.options.alternative_cn = Some("backend.internal".to_string())
+        })
+        .await;
+        assert!(o.ok(), "{:?}", o.err);
+        o.assert_no_sni();
+    }
+
+    #[tokio::test]
+    async fn ip_sni_with_alternative_cn_ignores_ip_san() {
+        let (cert, key) = fixture("ip_san");
+        let o = try_connect(&cert, &key, "127.0.0.1", |p| {
+            p.options.alternative_cn = Some("backend.internal".to_string())
+        })
+        .await;
+        assert_rejected(&o, "hostname mismatch");
+    }
+
+    #[tokio::test]
+    async fn bracketed_ipv6_sni_sends_no_sni_and_matches_ip_san() {
+        let (cert, key) = fixture("ip_san_v6");
+        let Some(o) = try_connect_on("::1", &cert, &key, "[::1]", |_| {}).await else {
+            eprintln!("skipped: ::1 cannot be bound");
+            return;
+        };
+        assert!(o.ok(), "{:?}", o.err);
+        o.assert_no_sni();
     }
 
     #[tokio::test]
     async fn dns_sni_still_sent_and_checked() {
         let (cert, key) = fixture("dns_backend");
-        let (ok, sni) = try_connect(&cert, &key, "backend.internal").await;
-        assert!(ok);
-        assert_eq!(sni.as_deref(), Some("backend.internal"));
+        let o = try_connect(&cert, &key, "backend.internal", |_| {}).await;
+        assert!(o.ok(), "{:?}", o.err);
+        assert_eq!(o.sni_seen, Some(Some("backend.internal".to_string())));
 
-        let (ok, _) = try_connect(&cert, &key, "other.internal").await;
-        assert!(!ok);
+        let o = try_connect(&cert, &key, "other.internal", |_| {}).await;
+        assert_rejected(&o, "hostname mismatch");
     }
 }
