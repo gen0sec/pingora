@@ -1106,6 +1106,17 @@ impl HttpSession {
         }
     }
 
+    /// Raise the retry buffer limit of a buffer that may already hold data.
+    ///
+    /// Returns `false` if no retry buffer is enabled or it has already
+    /// truncated, in which case the body must not be assumed replayable. The
+    /// limit never lowers. See [`FixedBuffer::raise_capacity`].
+    pub fn raise_retry_buffer_limit(&mut self, limit: usize) -> bool {
+        self.retry_buffer
+            .as_mut()
+            .is_some_and(|buffer| buffer.raise_capacity(limit))
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         self.retry_buffer.as_ref().and_then(|b| {
             if b.is_truncated() {

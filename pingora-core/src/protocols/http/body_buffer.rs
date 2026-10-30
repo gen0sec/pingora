@@ -71,6 +71,24 @@ impl FixedBuffer {
         true
     }
 
+    /// Raise the capacity of a buffer that may already hold data.
+    ///
+    /// Sound as long as nothing was dropped: bytes already in stay, and the
+    /// ceiling only grows. A truncated buffer cannot be repaired, so it is
+    /// left alone and this reports `false`. A `capacity` below the current
+    /// one changes nothing and still reports `true`: the ceiling never lowers.
+    ///
+    /// Exists so a later stage of a proxy (content scanning, a per-route body
+    /// cap) can grow the retry buffer that an earlier stage already started
+    /// filling, where [`Self::set_capacity`] would refuse.
+    pub fn raise_capacity(&mut self, capacity: usize) -> bool {
+        if self.truncated {
+            return false;
+        }
+        self.capacity = self.capacity.max(capacity);
+        true
+    }
+
     pub fn is_truncated(&self) -> bool {
         self.truncated
     }
@@ -128,5 +146,52 @@ mod tests {
         assert!(buf.is_truncated());
         assert!(!buf.set_capacity(1024));
         assert!(buf.is_truncated(), "still truncated after a refused resize");
+    }
+
+    #[test]
+    fn raise_after_partial_fill_keeps_bytes_and_accepts_more() {
+        let mut buf = FixedBuffer::new(4);
+        buf.write_to_buffer(&Bytes::from_static(b"abc"));
+
+        assert!(buf.raise_capacity(8));
+        assert!(!buf.is_truncated());
+        buf.write_to_buffer(&Bytes::from_static(b"defgh"));
+
+        assert!(!buf.is_truncated());
+        assert_eq!(buf.get_buffer().unwrap(), Bytes::from_static(b"abcdefgh"));
+
+        buf.write_to_buffer(&Bytes::from_static(b"i"));
+        assert!(buf.is_truncated(), "the new ceiling still applies");
+    }
+
+    #[test]
+    fn raise_after_truncation_is_refused() {
+        let mut buf = FixedBuffer::new(2);
+        buf.write_to_buffer(&Bytes::from_static(b"abcdef"));
+        assert!(buf.is_truncated());
+
+        assert!(!buf.raise_capacity(1024));
+        assert!(buf.is_truncated());
+        buf.write_to_buffer(&Bytes::from_static(b"x"));
+        assert!(buf.get_buffer().is_none());
+    }
+
+    #[test]
+    fn raise_to_a_lower_value_keeps_the_capacity() {
+        let mut buf = FixedBuffer::new(8);
+        buf.write_to_buffer(&Bytes::from_static(b"abc"));
+
+        assert!(buf.raise_capacity(2));
+        buf.write_to_buffer(&Bytes::from_static(b"defgh"));
+        assert!(!buf.is_truncated(), "capacity stayed at 8");
+        assert_eq!(buf.get_buffer().unwrap(), Bytes::from_static(b"abcdefgh"));
+    }
+
+    #[test]
+    fn raise_on_an_empty_buffer_works() {
+        let mut buf = FixedBuffer::new(2);
+        assert!(buf.raise_capacity(6));
+        buf.write_to_buffer(&Bytes::from_static(b"abcdef"));
+        assert!(!buf.is_truncated());
     }
 }

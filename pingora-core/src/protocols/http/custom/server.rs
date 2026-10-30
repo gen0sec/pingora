@@ -160,6 +160,13 @@ pub trait Session: Send + Sync + Unpin + 'static {
         false
     }
 
+    /// Raise the retry buffer limit while nothing has been dropped. Defaulted
+    /// so existing custom sessions keep compiling; `false` means the limit was
+    /// not raised.
+    fn raise_retry_buffer_limit(&mut self, _limit: usize) -> bool {
+        false
+    }
+
     fn retry_buffer_truncated(&self) -> bool;
 
     fn get_retry_buffer(&self) -> Option<Bytes>;
