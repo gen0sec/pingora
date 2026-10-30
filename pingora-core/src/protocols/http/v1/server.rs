@@ -1278,6 +1278,17 @@ impl HttpSession {
         }
     }
 
+    /// Raise the retry buffer limit of a buffer that may already hold data.
+    ///
+    /// Returns `false` if no retry buffer is enabled or it has already
+    /// truncated, in which case the body must not be assumed replayable. The
+    /// limit never lowers. See [`FixedBuffer::raise_capacity`].
+    pub fn raise_retry_buffer_limit(&mut self, limit: usize) -> bool {
+        self.retry_buffer
+            .as_mut()
+            .is_some_and(|buffer| buffer.raise_capacity(limit))
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         self.retry_buffer.as_ref().and_then(|b| {
             if b.is_truncated() {
@@ -2016,6 +2027,56 @@ mod tests_stream {
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    #[tokio::test]
+    async fn raise_retry_buffer_limit_without_a_buffer_is_false() {
+        init_log();
+        let mock_io = Builder::new().build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        assert!(!http_stream.raise_retry_buffer_limit(1024));
+        assert!(http_stream.get_retry_buffer().is_none());
+    }
+
+    #[tokio::test]
+    async fn raise_retry_buffer_limit_after_partial_fill() {
+        init_log();
+        let input = b"POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&input[..])
+            .read(b"abcd")
+            .read(b"efghij")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.enable_retry_buffering_with_limit(4));
+
+        let first = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), b"abcd");
+        assert!(http_stream.raise_retry_buffer_limit(16));
+
+        let second = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(second.as_ref(), b"efghij");
+        assert!(!http_stream.retry_buffer_truncated());
+        assert_eq!(
+            http_stream.get_retry_buffer().unwrap().as_ref(),
+            b"abcdefghij"
+        );
+    }
+
+    #[tokio::test]
+    async fn raise_retry_buffer_limit_after_truncation_is_refused() {
+        init_log();
+        let input = b"POST / HTTP/1.1\r\nContent-Length: 6\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).read(b"abcdef").build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.enable_retry_buffering_with_limit(4));
+        http_stream.read_body_bytes().await.unwrap();
+
+        assert!(http_stream.retry_buffer_truncated());
+        assert!(!http_stream.raise_retry_buffer_limit(1024));
+        assert!(http_stream.retry_buffer_truncated());
     }
 
     #[tokio::test]

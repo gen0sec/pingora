@@ -721,6 +721,19 @@ where
         }
     }
 
+    /// Raise the retry buffer limit while nothing has been dropped.
+    ///
+    /// Returns `false` if no retry buffer is enabled, it has truncated, or the
+    /// session cannot retain a body. The limit never lowers.
+    pub fn raise_retry_buffer_limit(&mut self, limit: usize) -> bool {
+        match self {
+            Self::H1(s) => s.raise_retry_buffer_limit(limit),
+            Self::H2(s) => s.raise_retry_buffer_limit(limit),
+            Self::Subrequest(s) => s.raise_retry_buffer_limit(limit),
+            Self::Custom(s) => s.raise_retry_buffer_limit(limit),
+        }
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         match self {
             Self::H1(s) => s.get_retry_buffer(),
