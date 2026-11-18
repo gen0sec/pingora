@@ -165,6 +165,18 @@ where
         Ok(())
     }
 
+    /// Whether [Self::request_body_filter()] needs to run for this body chunk.
+    ///
+    /// Returning `false` skips the filter for this call: the body and the end-of-stream flag are
+    /// left untouched, exactly as if the filter had run and returned `Ok(())` without changing
+    /// anything. This saves the future the async filter would otherwise allocate per call.
+    ///
+    /// This is checked on every call, so the answer may change over a request's lifetime.
+    /// By default it returns `true`, which keeps the filter running on every call.
+    fn request_body_filter_needed(&self, _session: &Session<DS>, _ctx: &Self::CTX) -> bool {
+        true
+    }
+
     /// This filter decides if the request is cacheable and what cache backend to use
     ///
     /// The caller can interact with `Session.cache` to enable caching.
@@ -502,6 +514,19 @@ where
         Self::CTX: Send + Sync,
     {
         Ok(None)
+    }
+
+    /// Whether [Self::response_body_filter()] needs to run for this body chunk.
+    ///
+    /// Returning `false` skips the filter for this call: the body is left untouched and no
+    /// delay is applied, exactly as if the filter had run and returned `Ok(None)` without
+    /// changing anything. This saves the future the async filter would otherwise allocate per
+    /// call.
+    ///
+    /// This is checked on every call, so the answer may change over a response's lifetime.
+    /// By default it returns `true`, which keeps the filter running on every call.
+    fn response_body_filter_needed(&self, _session: &Session<DS>, _ctx: &Self::CTX) -> bool {
+        true
     }
 
     /// Similar to [Self::response_filter()] but for response trailers.

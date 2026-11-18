@@ -5797,3 +5797,85 @@ mod test_cache {
         );
     }
 }
+
+// Echo the request body back, so one origin serves both the request and response body tests.
+async fn body_filter_origin() -> (HttpOrigin, mpsc::UnboundedReceiver<http::Request<Bytes>>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let origin = HttpOrigin::bind(move |request| {
+        let tx = tx.clone();
+        async move {
+            let body = request.body().clone();
+            let _ = tx.send(request);
+            http::Response::new(body)
+        }
+    })
+    .await
+    .unwrap();
+    (origin, rx)
+}
+
+async fn body_filter_post(port: u16, headers: &[(&str, &str)]) -> String {
+    let client = reqwest::Client::new();
+    let mut req = client
+        .post("http://127.0.0.1:6147/body_filter")
+        .header("x-port", port.to_string())
+        .body("hello");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let res = req.send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    res.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn test_request_body_filter_runs_when_needed_by_default() {
+    init_proxy().await;
+    let (origin, mut received) = body_filter_origin().await;
+    body_filter_post(origin.addr().port(), &[("x-uppercase-request-body", "1")]).await;
+    let upstream = receive_http_origin_request(&mut received).await;
+    origin.shutdown().await;
+    assert_eq!(upstream.body().as_ref(), b"HELLO");
+}
+
+#[tokio::test]
+async fn test_request_body_filter_skipped_when_not_needed() {
+    init_proxy().await;
+    let (origin, mut received) = body_filter_origin().await;
+    body_filter_post(
+        origin.addr().port(),
+        &[
+            ("x-uppercase-request-body", "1"),
+            ("x-skip-request-body-filter", "1"),
+        ],
+    )
+    .await;
+    let upstream = receive_http_origin_request(&mut received).await;
+    origin.shutdown().await;
+    assert_eq!(upstream.body().as_ref(), b"hello");
+}
+
+#[tokio::test]
+async fn test_response_body_filter_runs_when_needed_by_default() {
+    init_proxy().await;
+    let (origin, _received) = body_filter_origin().await;
+    let body = body_filter_post(origin.addr().port(), &[("x-uppercase-response-body", "1")]).await;
+    origin.shutdown().await;
+    assert_eq!(body, "HELLO");
+}
+
+#[tokio::test]
+async fn test_response_body_filter_skipped_when_not_needed() {
+    init_proxy().await;
+    let (origin, _received) = body_filter_origin().await;
+    let body = body_filter_post(
+        origin.addr().port(),
+        &[
+            ("x-uppercase-response-body", "1"),
+            ("x-skip-response-body-filter", "1"),
+        ],
+    )
+    .await;
+    origin.shutdown().await;
+    assert_eq!(body, "hello");
+}

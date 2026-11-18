@@ -825,11 +825,14 @@ where
                 }
 
                 let mut data = range_body_filter.filter_body(data);
-                if let Some(duration) = self
-                    .inner
-                    .response_body_filter(session, &mut data, eos, ctx)
-                    .await?
-                {
+                let delay = if self.inner.response_body_filter_needed(session, ctx) {
+                    self.inner
+                        .response_body_filter(session, &mut data, eos, ctx)
+                        .await?
+                } else {
+                    None
+                };
+                if let Some(duration) = delay {
                     trace!("delaying response for {duration:?}");
                     time::sleep(duration).await;
                 }
@@ -843,11 +846,14 @@ where
                 }
 
                 // range body filter doesn't apply to upgraded body
-                if let Some(duration) = self
-                    .inner
-                    .response_body_filter(session, &mut data, eos, ctx)
-                    .await?
-                {
+                let delay = if self.inner.response_body_filter_needed(session, ctx) {
+                    self.inner
+                        .response_body_filter(session, &mut data, eos, ctx)
+                        .await?
+                } else {
+                    None
+                };
+                if let Some(duration) = delay {
                     trace!("delaying upgraded response for {duration:?}");
                     time::sleep(duration).await;
                 }
@@ -916,9 +922,11 @@ where
             .request_body_filter(&mut data, end_of_body)
             .await?;
 
-        self.inner
-            .request_body_filter(session, &mut data, end_of_body, ctx)
-            .await?;
+        if self.inner.request_body_filter_needed(session, ctx) {
+            self.inner
+                .request_body_filter(session, &mut data, end_of_body, ctx)
+                .await?;
+        }
 
         if session.was_upgraded() {
             client_body.upgrade_body_writer();
