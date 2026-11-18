@@ -172,6 +172,9 @@ where
     /// anything. This saves the future the async filter would otherwise allocate per call.
     ///
     /// This is checked on every call, so the answer may change over a request's lifetime.
+    /// A filter that keeps state across chunks, or waits for the end of the body, misses
+    /// every chunk skipped before the answer turned `true`. Such an app should give one
+    /// answer for the whole body, and lean to `true` when unsure.
     /// By default it returns `true`, which keeps the filter running on every call.
     fn request_body_filter_needed(&self, _session: &Session<DS>, _ctx: &Self::CTX) -> bool {
         true
@@ -524,6 +527,9 @@ where
     /// call.
     ///
     /// This is checked on every call, so the answer may change over a response's lifetime.
+    /// A filter that keeps state across chunks, or waits for the end of the body, misses
+    /// every chunk skipped before the answer turned `true`. Such an app should give one
+    /// answer for the whole body, and lean to `true` when unsure.
     /// By default it returns `true`, which keeps the filter running on every call.
     fn response_body_filter_needed(&self, _session: &Session<DS>, _ctx: &Self::CTX) -> bool {
         true
