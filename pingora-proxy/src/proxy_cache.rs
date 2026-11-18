@@ -468,11 +468,14 @@ where
                             raw_body
                         };
 
-                        match self
-                            .inner
-                            .response_body_filter(session, &mut body, end, ctx)
-                            .await
-                        {
+                        let filtered = if self.inner.response_body_filter_needed(session, ctx) {
+                            self.inner
+                                .response_body_filter(session, &mut body, end, ctx)
+                                .await
+                        } else {
+                            Ok(None)
+                        };
+                        match filtered {
                             Ok(Some(duration)) => {
                                 trace!("delaying response for {duration:?}");
                                 time::sleep(duration).await;

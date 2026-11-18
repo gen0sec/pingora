@@ -356,7 +356,50 @@ impl ProxyHttp for ExampleProxyHttp {
         {
             *body = None;
         }
+        // length-preserving, so the upstream framing stays valid
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-uppercase-request-body")
+        {
+            if let Some(body) = body {
+                *body = bytes::Bytes::from(body.to_ascii_uppercase());
+            }
+        }
         Ok(())
+    }
+
+    fn request_body_filter_needed(&self, session: &Session, _ctx: &Self::CTX) -> bool {
+        !session
+            .req_header()
+            .headers
+            .contains_key("x-skip-request-body-filter")
+    }
+
+    async fn response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-uppercase-response-body")
+        {
+            if let Some(body) = body {
+                *body = bytes::Bytes::from(body.to_ascii_uppercase());
+            }
+        }
+        Ok(None)
+    }
+
+    fn response_body_filter_needed(&self, session: &Session, _ctx: &Self::CTX) -> bool {
+        !session
+            .req_header()
+            .headers
+            .contains_key("x-skip-response-body-filter")
     }
 
     async fn upstream_request_filter(

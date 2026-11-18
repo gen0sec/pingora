@@ -1027,11 +1027,14 @@ where
                 }
 
                 let mut data = range_body_filter.filter_body(data);
-                if let Some(duration) = self
-                    .inner
-                    .response_body_filter(session, &mut data, eos, ctx)
-                    .await?
-                {
+                let delay = if self.inner.response_body_filter_needed(session, ctx) {
+                    self.inner
+                        .response_body_filter(session, &mut data, eos, ctx)
+                        .await?
+                } else {
+                    None
+                };
+                if let Some(duration) = delay {
                     trace!("delaying downstream response for {duration:?}");
                     time::sleep(duration).await;
                 }
@@ -1133,9 +1136,11 @@ where
             .request_body_filter(&mut data, end_of_body)
             .await?;
 
-        self.inner
-            .request_body_filter(session, &mut data, end_of_body, ctx)
-            .await?;
+        if self.inner.request_body_filter_needed(session, ctx) {
+            self.inner
+                .request_body_filter(session, &mut data, end_of_body, ctx)
+                .await?;
+        }
 
         /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
          * Although there is no harm writing empty byte to h2, unlike h1, we ignore it

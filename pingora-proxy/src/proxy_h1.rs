@@ -1011,11 +1011,14 @@ where
 
                 // before it can mark it as cacheable again.
                 let mut data = range_body_filter.filter_body(data);
-                if let Some(duration) = self
-                    .inner
-                    .response_body_filter(session, &mut data, end, ctx)
-                    .await?
-                {
+                let delay = if self.inner.response_body_filter_needed(session, ctx) {
+                    self.inner
+                        .response_body_filter(session, &mut data, end, ctx)
+                        .await?
+                } else {
+                    None
+                };
+                if let Some(duration) = delay {
                     trace!("delaying downstream response for {:?}", duration);
                     time::sleep(duration).await;
                 }
@@ -1030,11 +1033,14 @@ where
                 }
 
                 // range doesn't apply to upgraded body
-                if let Some(duration) = self
-                    .inner
-                    .response_body_filter(session, &mut data, end, ctx)
-                    .await?
-                {
+                let delay = if self.inner.response_body_filter_needed(session, ctx) {
+                    self.inner
+                        .response_body_filter(session, &mut data, end, ctx)
+                        .await?
+                } else {
+                    None
+                };
+                if let Some(duration) = delay {
                     trace!("delaying downstream upgraded response for {:?}", duration);
                     time::sleep(duration).await;
                 }
@@ -1083,9 +1089,11 @@ where
 
         // TODO: request body filter to have info about upgraded status?
         // (can also check session.was_upgraded())
-        self.inner
-            .request_body_filter(session, &mut data, end_of_body, ctx)
-            .await?;
+        if self.inner.request_body_filter_needed(session, ctx) {
+            self.inner
+                .request_body_filter(session, &mut data, end_of_body, ctx)
+                .await?;
+        }
 
         // the flag to signal to upstream
         let upstream_end_of_body = end_of_body || data.is_none();
