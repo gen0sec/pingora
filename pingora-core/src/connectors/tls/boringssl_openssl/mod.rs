@@ -15,7 +15,7 @@
 use log::debug;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use std::net::IpAddr;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 
 use crate::connectors::tls::replace_leftmost_underscore;
 use crate::connectors::ConnectorOptions;
@@ -77,6 +77,25 @@ const SIGALG_LIST: &str = "ecdsa_secp256r1_sha256\
 #[cfg(feature = "boringssl")]
 const BORINGSSL_CURVES_LIST: &str = "X25519:P-256:P-384:P-521";
 
+type KeylogHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+static KEYLOG_HOOK: OnceLock<KeylogHook> = OnceLock::new();
+
+/// Routes the upstream TLS key log lines (NSS format) to `hook`.
+///
+/// The hook is process-wide and can be set once. Returns `false`, and keeps the first
+/// hook, if one is already set. It takes precedence over `debug_ssl_keylog` and
+/// `SSLKEYLOGFILE`, and applies to every upstream TLS connector built after the call.
+///
+/// The hook runs on the threads that perform handshakes: it must be cheap and must not block.
+pub fn set_keylog_hook(hook: KeylogHook) -> bool {
+    KEYLOG_HOOK.set(hook).is_ok()
+}
+
+pub(crate) fn keylog_hook() -> Option<&'static KeylogHook> {
+    KEYLOG_HOOK.get()
+}
+
 static INIT_CA_ENV: Once = Once::new();
 fn init_ssl_cert_env_vars() {
     // this sets env vars to pick up the root certs
@@ -120,7 +139,7 @@ impl Connector {
 
                 builder.set_private_key_file(key, SslFiletype::PEM).unwrap();
             }
-            if conf.debug_ssl_keylog {
+            if conf.debug_ssl_keylog && keylog_hook().is_none() {
                 // write TLS keys to file specified by SSLKEYLOGFILE if it exists
                 if let Some(keylog) = std::env::var_os("SSLKEYLOGFILE").and_then(|path| {
                     std::fs::OpenOptions::new()
@@ -138,6 +157,11 @@ impl Connector {
         } else {
             init_ssl_cert_env_vars();
             builder.set_default_verify_paths().unwrap();
+        }
+
+        if let Some(hook) = keylog_hook() {
+            let hook = hook.clone();
+            builder.set_keylog_callback(move |_, line| hook(line));
         }
 
         Connector {
@@ -383,6 +407,46 @@ mod tests {
                 "callback must run and see no SNI"
             );
         }
+    }
+
+    /// The hook is process-wide and set once: this is the only test that sets it.
+    #[tokio::test]
+    async fn keylog_hook_receives_upstream_handshake_keys() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = lines.clone();
+        assert!(set_keylog_hook(Arc::new(move |line: &str| {
+            sink.lock().unwrap().push(line.to_string());
+        })));
+        assert!(!set_keylog_hook(Arc::new(|_: &str| {})), "set once only");
+
+        let (cert, key) = fixture("dns_backend");
+        let mut acc = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        acc.set_certificate(&cert).unwrap();
+        acc.set_private_key(&key).unwrap();
+        let acc = acc.build();
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut s = acc.accept(server).unwrap();
+            let _ = std::io::Write::write_all(&mut s, b"x");
+        });
+        client.set_nonblocking(true).unwrap();
+        let tcp = tokio::net::UnixStream::from_std(client).unwrap();
+        let mut peer = HttpPeer::new("127.0.0.1:443", true, "".to_string());
+        peer.options.verify_cert = false;
+        let connector = Connector::new(None);
+        connect(tcp, &peer, None, &connector.ctx).await.unwrap();
+        server.join().unwrap();
+
+        let lines = lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("CLIENT_HANDSHAKE_TRAFFIC_SECRET")),
+            "keylog lines: {lines:?}"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.starts_with("CLIENT_TRAFFIC_SECRET_0")));
     }
 
     /// Connects to a server presenting `cert`, with `sni` as the peer name.

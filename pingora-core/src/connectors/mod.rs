@@ -18,6 +18,8 @@ pub mod http;
 pub mod l4;
 #[cfg(feature = "any_tls")]
 mod tls;
+#[cfg(feature = "openssl_derived")]
+pub use tls::set_keylog_hook;
 
 #[cfg(not(feature = "any_tls"))]
 use crate::tls::connectors as tls;
